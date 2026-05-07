@@ -300,7 +300,10 @@ class EnvironmentRequestHandler(BaseHTTPRequestHandler):
     def _environment_current(self, query: dict[str, list[str]]) -> dict[str, Any]:
         wait_for = (_first_query_value(query, "wait_for") or "").strip()
         if not wait_for:
-            return self.server.store.current()
+            return _attach_state_query_learning(
+                self.server.store.current(),
+                self.server.feedback_store,
+            )
         if wait_for != "room_light":
             raise ValueError("unsupported_wait_for")
 
@@ -311,7 +314,10 @@ class EnvironmentRequestHandler(BaseHTTPRequestHandler):
         reason = ""
 
         while True:
-            current = self.server.store.current()
+            current = _attach_state_query_learning(
+                self.server.store.current(),
+                self.server.feedback_store,
+            )
             matched, observed_at = _room_light_matches_after(current, after)
             if matched:
                 reason = "matched"
@@ -446,3 +452,24 @@ def _room_light_matches_after(current: dict[str, Any], after: datetime | None) -
     if not source_snapshot_id:
         return False, observed_text
     return observed > after, observed_text
+
+
+def _attach_state_query_learning(
+    current: dict[str, Any],
+    feedback_store: StateQueryFeedbackStore | None,
+) -> dict[str, Any]:
+    if feedback_store is None:
+        return current
+    state_queries = current.get("state_queries")
+    if not isinstance(state_queries, dict):
+        return current
+    room_light = state_queries.get("room_light")
+    if not isinstance(room_light, dict):
+        return current
+    try:
+        learning = feedback_store.summary(target="room_light").get("learning")
+    except Exception:
+        return current
+    if isinstance(learning, dict):
+        room_light["learning"] = learning
+    return current

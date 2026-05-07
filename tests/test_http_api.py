@@ -47,6 +47,66 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_environment_current_projects_room_light_learning(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        observed = datetime.now(UTC)
+        store.ingest_vision_envelope(
+            {
+                "topic": "/vision/room_light/state",
+                "header": {
+                    "seq": 12,
+                    "stamp": observed.timestamp(),
+                    "frame_id": "cam0",
+                },
+                "payload": {
+                    "state": "unknown",
+                    "confidence": 0.2,
+                    "lighting_type": "daylight",
+                    "daylight_state": "present",
+                    "sequence": {"last_frame_id": 12},
+                },
+            },
+            source="vision_snapshot_processor",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            feedback_store = StateQueryFeedbackStore(Path(temp_dir) / "state-query-feedback.jsonl")
+            feedback_store.append(
+                {
+                    "target": "room_light",
+                    "state_query_id": "room_light",
+                    "idempotency_key": "state-query-feedback:test:env-1:on",
+                    "snapshot_id": "env-1",
+                    "predicted_state": "unknown",
+                    "predicted_confidence_label": "low",
+                    "user_label": "on",
+                    "user_text": "ついてる",
+                    "feedback_reason": "user_correction_after_state_query",
+                    "source_context": "state_query",
+                }
+            )
+            server = EnvironmentHttpServer(
+                ("127.0.0.1", 0),
+                store=store,
+                api_token="secret",
+                feedback_store=feedback_store,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/environment/current"
+                request = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+
+                learning = body["state_queries"]["room_light"]["learning"]
+                self.assertEqual(learning["level"], "collecting")
+                self.assertEqual(learning["accepted_count"], 1)
+                self.assertEqual(learning["label_balance"]["on"], 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_indicators_current_is_public_and_sanitized(self) -> None:
         store = EnvironmentStateStore()
         server = EnvironmentHttpServer(("127.0.0.1", 0), store=store, api_token="secret")
@@ -407,6 +467,14 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 self.assertEqual(summary["summary"]["status_counts"]["duplicate"], 1)
                 self.assertEqual(summary["summary"]["status_counts"]["rejected"], 0)
                 self.assertEqual(summary["summary"]["runtime_status_counts"]["duplicate"], 1)
+                self.assertEqual(summary["summary"]["learning"]["level"], "collecting")
+                self.assertEqual(summary["summary"]["learning"]["level_index"], 1)
+                self.assertEqual(summary["summary"]["learning"]["accepted_count"], 1)
+                self.assertEqual(summary["summary"]["learning"]["label_balance"]["on"], 1)
+                self.assertIn(
+                    "duplicate_feedback_seen",
+                    [problem["code"] for problem in summary["summary"]["learning"]["problems"]],
+                )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -485,10 +553,77 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 self.assertEqual(summary["summary"]["source_context_counts"]["post_light_action"], 1)
                 self.assertEqual(summary["summary"]["action_counts"]["light_off"], 1)
                 self.assertEqual(summary["summary"]["expected_state_counts"]["off"], 1)
+                self.assertEqual(summary["summary"]["learning"]["post_action_count"], 1)
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
+
+    def test_state_query_feedback_summary_reports_learning_level_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            feedback_store = StateQueryFeedbackStore(Path(temp_dir) / "state-query-feedback.jsonl")
+
+            initial = feedback_store.summary(target="room_light")
+            self.assertEqual(initial["learning"]["level"], "none")
+            self.assertEqual(initial["learning"]["level_index"], 0)
+            self.assertIn("no_feedback", [problem["code"] for problem in initial["learning"]["problems"]])
+            self.assertFalse(initial["learning"]["ok"])
+
+            for index, label in enumerate(["on", "off", "on", "off", "on", "off"], start=1):
+                feedback_store.append(
+                    {
+                        "target": "room_light",
+                        "state_query_id": "room_light",
+                        "idempotency_key": f"state-query-feedback:test:{index}:{label}",
+                        "snapshot_id": f"env_20260507_1415{index:02d}_000001",
+                        "predicted_state": "unknown",
+                        "predicted_confidence_label": "low",
+                        "user_label": label,
+                        "user_text": "ついてる" if label == "on" else "消えてる",
+                        "feedback_reason": "user_correction_after_state_query",
+                        "source_context": "state_query",
+                    }
+                )
+
+            usable = feedback_store.summary(target="room_light")
+            self.assertEqual(usable["learning"]["level"], "usable")
+            self.assertEqual(usable["learning"]["level_index"], 3)
+            self.assertEqual(usable["learning"]["accepted_count"], 6)
+            self.assertEqual(usable["learning"]["label_balance"]["on"], 3)
+            self.assertEqual(usable["learning"]["label_balance"]["off"], 3)
+            self.assertIn(
+                "no_post_action_feedback",
+                [problem["code"] for problem in usable["learning"]["problems"]],
+            )
+
+            for index, label in enumerate(["on", "off", "on", "off", "on", "off"], start=7):
+                feedback_store.append(
+                    {
+                        "target": "room_light",
+                        "state_query_id": "room_light",
+                        "idempotency_key": f"state-query-feedback:test:{index}:{label}",
+                        "snapshot_id": f"env_20260507_1415{index:02d}_000001",
+                        "predicted_state": "unknown",
+                        "predicted_confidence_label": "low",
+                        "user_label": label,
+                        "user_text": "ついてる" if label == "on" else "消えてる",
+                        "feedback_reason": "user_correction_after_light_action",
+                        "source_context": "post_light_action",
+                        "action_id": "light_on" if label == "on" else "light_off",
+                        "expected_state": label,
+                    }
+                )
+
+            reinforced = feedback_store.summary(target="room_light")
+            self.assertEqual(reinforced["learning"]["level"], "reinforced")
+            self.assertEqual(reinforced["learning"]["level_index"], 4)
+            self.assertEqual(reinforced["learning"]["accepted_count"], 12)
+            self.assertEqual(reinforced["learning"]["post_action_count"], 6)
+            self.assertNotIn(
+                "no_post_action_feedback",
+                [problem["code"] for problem in reinforced["learning"]["problems"]],
+            )
+            self.assertTrue(reinforced["learning"]["ok"])
 
     def test_state_query_feedback_accepts_stale_pending_with_warning(self) -> None:
         store = EnvironmentStateStore()

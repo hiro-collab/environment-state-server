@@ -18,6 +18,13 @@ MAX_USER_TEXT_LENGTH = 500
 MAX_STRING_LENGTH = 2000
 MAX_RECENT_LIMIT = 100
 MAX_PENDING_AGE_SECONDS = 120
+LEARNING_LEVELS = (
+    "none",
+    "collecting",
+    "seeded",
+    "usable",
+    "reinforced",
+)
 
 
 class StateQueryFeedbackStore:
@@ -100,6 +107,14 @@ class StateQueryFeedbackStore:
             status_counts[status] = status_counts.get(status, 0) + count
         recent_status_counts = _with_status_keys(_count_by_key(recent_items, "status"))
         latest = items[-1] if items else {}
+        learning = _learning_summary(
+            target=target_id or "",
+            items=items,
+            label_counts=label_counts,
+            reason_counts=reason_counts,
+            source_context_counts=source_context_counts,
+            status_counts=status_counts,
+        )
         return {
             "target": target_id or "",
             "total_count": len(items),
@@ -114,6 +129,7 @@ class StateQueryFeedbackStore:
             "recent_status_counts": recent_status_counts,
             "latest_received_at": latest.get("received_at", ""),
             "latest_feedback_id": latest.get("feedback_id", ""),
+            "learning": learning,
         }
 
     def _normalize(
@@ -237,6 +253,146 @@ def _room_light_state(value: object) -> str:
 def _confidence_label(value: object) -> str:
     label = _optional_identifier(value) or "none"
     return label if label in {"none", "low", "medium", "high"} else "none"
+
+
+def _learning_summary(
+    *,
+    target: str,
+    items: list[dict[str, Any]],
+    label_counts: dict[str, int],
+    reason_counts: dict[str, int],
+    source_context_counts: dict[str, int],
+    status_counts: dict[str, int],
+) -> dict[str, Any]:
+    accepted_count = len(items)
+    warning_count = sum(1 for item in items if item.get("status") == "accepted_with_warning")
+    on_count = int(label_counts.get("on", 0))
+    off_count = int(label_counts.get("off", 0))
+    daylight_count = int(label_counts.get("daylight", 0))
+    unknown_count = int(label_counts.get("unknown", 0))
+    post_action_count = int(source_context_counts.get("post_light_action", 0))
+    state_query_count = int(source_context_counts.get("state_query", 0))
+    stale_ratio = (warning_count / accepted_count) if accepted_count else 0.0
+
+    level_index = 0
+    if accepted_count >= 1:
+        level_index = 1
+    if accepted_count >= 3:
+        level_index = 2
+    if accepted_count >= 6 and on_count > 0 and off_count > 0:
+        level_index = 3
+    if accepted_count >= 12 and on_count > 0 and off_count > 0 and post_action_count >= 4:
+        level_index = 4
+
+    problems: list[dict[str, str]] = []
+    if accepted_count == 0:
+        problems.append(
+            _learning_problem(
+                "no_feedback",
+                "error",
+                "room_light のユーザー訂正 feedback がまだ保存されていません。",
+            )
+        )
+    elif accepted_count < 3:
+        problems.append(
+            _learning_problem(
+                "few_feedback",
+                "warning",
+                "feedback が少なく、学習材料としてはまだ初期段階です。",
+            )
+        )
+    if accepted_count > 0 and on_count == 0:
+        problems.append(
+            _learning_problem(
+                "missing_on_label",
+                "warning",
+                "点灯状態の user_label=on がまだありません。",
+            )
+        )
+    if accepted_count > 0 and off_count == 0:
+        problems.append(
+            _learning_problem(
+                "missing_off_label",
+                "warning",
+                "消灯状態の user_label=off がまだありません。",
+            )
+        )
+    if accepted_count >= 3 and post_action_count == 0:
+        problems.append(
+            _learning_problem(
+                "no_post_action_feedback",
+                "warning",
+                "操作後確認由来の source_context=post_light_action がまだありません。",
+            )
+        )
+    if stale_ratio > 0.33:
+        problems.append(
+            _learning_problem(
+                "stale_feedback_ratio_high",
+                "warning",
+                "古い pending に対する feedback の割合が高めです。",
+            )
+        )
+    if int(status_counts.get("rejected", 0)) > 0:
+        problems.append(
+            _learning_problem(
+                "rejected_feedback_seen",
+                "error",
+                "不正な feedback が reject されています。Dify の payload 正規化を確認してください。",
+            )
+        )
+    if int(status_counts.get("duplicate", 0)) > 0:
+        problems.append(
+            _learning_problem(
+                "duplicate_feedback_seen",
+                "warning",
+                "同じ idempotency_key の重複送信が検出されています。",
+            )
+        )
+
+    return {
+        "target": target,
+        "level": LEARNING_LEVELS[level_index],
+        "level_index": level_index,
+        "accepted_count": accepted_count,
+        "warning_count": warning_count,
+        "stale_ratio": round(stale_ratio, 4),
+        "post_action_count": post_action_count,
+        "state_query_count": state_query_count,
+        "label_balance": {
+            "on": on_count,
+            "off": off_count,
+            "daylight": daylight_count,
+            "unknown": unknown_count,
+            "has_on": on_count > 0,
+            "has_off": off_count > 0,
+        },
+        "reason_counts": dict(reason_counts),
+        "source_context_counts": dict(source_context_counts),
+        "problems": problems,
+        "ok": not any(problem["severity"] == "error" for problem in problems),
+        "next_level_hint": _next_learning_level_hint(level_index),
+    }
+
+
+def _learning_problem(code: str, severity: str, message: str) -> dict[str, str]:
+    return {
+        "code": code,
+        "severity": severity,
+        "message": message,
+    }
+
+
+def _next_learning_level_hint(level_index: int) -> str:
+    if level_index <= 0:
+        return "まず状態照会または操作後確認でユーザー訂正を1件保存してください。"
+    if level_index == 1:
+        return "最低3件の feedback を集めると seeded になります。"
+    if level_index == 2:
+        return "on/off の両方を含む6件以上の feedback で usable になります。"
+    if level_index == 3:
+        return "12件以上、かつ操作後確認由来が4件以上になると reinforced になります。"
+    return "十分な初期学習材料があります。偏りや stale warning を継続監視してください。"
 
 
 def _feedback_warnings(
