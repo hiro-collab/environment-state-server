@@ -33,7 +33,11 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertRegex(current["snapshot_id"], r"^env_20260506_140001_\d{6}$")
         self.assertEqual(current["sequence"], 1)
         self.assertEqual(current["age_ms"], 1000)
+        self.assertEqual(current["freshness"]["level"], "fresh")
+        self.assertEqual(current["freshness"]["age_ms"], 1000)
+        self.assertEqual(current["freshness"]["ttl_ms"], 5000)
         self.assertEqual(current["appliances"]["light"]["state"], "off")
+        self.assertEqual(current["appliances"]["light"]["freshness"]["level"], "fresh")
         self.assertEqual(current["appliances"]["light"]["execution_id"], "exec-1")
         self.assertEqual(current["last_home_assistant_events"][0]["status"], "succeeded")
         light_off = next(action for action in current["actions"] if action["action_id"] == "light_off")
@@ -113,11 +117,36 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         current = store.current(now=datetime(2026, 5, 6, 14, 0, 2, tzinfo=UTC))
 
         self.assertTrue(current["stale"])
+        self.assertEqual(current["freshness"]["level"], "stale")
+        self.assertEqual(current["freshness"]["reason"], "age_exceeds_ttl")
         self.assertTrue(current["appliances"]["fan"]["stale"])
+        self.assertEqual(current["appliances"]["fan"]["freshness"]["level"], "stale")
         fan_on = next(action for action in current["actions"] if action["action_id"] == "fan_on")
         self.assertTrue(fan_on["available"])
         self.assertFalse(fan_on["noop"])
         self.assertEqual(fan_on["reason"], "current_state_stale")
+
+    def test_freshness_levels_match_snapshot_age_windows(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        store.ingest_home_assistant_event(
+            {
+                "event": "execute_succeeded",
+                "action_id": "fan_on",
+                "executed": True,
+                "timestamp": "2026-05-06T14:00:00+00:00",
+            }
+        )
+
+        recent = store.current(now=datetime(2026, 5, 6, 14, 0, 3, tzinfo=UTC))
+        usable = store.current(now=datetime(2026, 5, 6, 14, 0, 4, 500000, tzinfo=UTC))
+        stale = store.current(now=datetime(2026, 5, 6, 14, 0, 6, tzinfo=UTC))
+
+        self.assertEqual(recent["freshness"]["level"], "recent")
+        self.assertEqual(recent["appliances"]["fan"]["freshness"]["level"], "recent")
+        self.assertEqual(usable["freshness"]["level"], "usable")
+        self.assertEqual(usable["appliances"]["fan"]["freshness"]["level"], "usable")
+        self.assertEqual(stale["freshness"]["level"], "stale")
+        self.assertEqual(stale["appliances"]["fan"]["freshness"]["level"], "stale")
 
     def test_camera_room_light_topic_updates_vision_state(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
@@ -161,6 +190,8 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertEqual(room_light["sequence"]["frame_count"], 2)
         self.assertEqual(room_light["sequence"]["temporal_window_ms"], 1000)
         self.assertEqual(room_light["source"], "camera_hub")
+        self.assertEqual(room_light["freshness"]["level"], "fresh")
+        self.assertEqual(room_light["freshness"]["age_ms"], 1000)
 
         query = current["state_queries"]["room_light"]
         self.assertTrue(query["available"])
@@ -173,6 +204,8 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertEqual(query["observed_at"], "2026-05-06T14:00:00+00:00")
         self.assertEqual(query["updated_at"], "2026-05-06T14:00:00+00:00")
         self.assertEqual(query["source_snapshot_id"], "obs-1")
+        self.assertEqual(query["freshness"]["level"], "fresh")
+        self.assertEqual(query["freshness"]["age_ms"], 1000)
         self.assertEqual(query["stale_reason"], "")
         self.assertEqual(query["evidence"]["source"], "camera_hub")
         self.assertEqual(query["evidence"]["topic"], "/vision/room_light/state")
@@ -206,6 +239,8 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertTrue(sources["camera_hub"]["stale"])
         self.assertFalse(sources["camera_hub"]["available"])
         self.assertFalse(sources["vision_snapshot_processor"]["stale"])
+        self.assertEqual(sources["camera_hub"]["freshness"]["level"], "stale")
+        self.assertEqual(sources["vision_snapshot_processor"]["freshness"]["level"], "fresh")
         self.assertEqual(
             current["vision"]["room_light"]["source"],
             "vision_snapshot_processor",
@@ -288,6 +323,8 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertIsNone(query["observed_at"])
         self.assertIsNone(query["updated_at"])
         self.assertEqual(query["source_snapshot_id"], "")
+        self.assertEqual(query["freshness"]["level"], "stale")
+        self.assertEqual(query["freshness"]["reason"], "room_light_missing")
         self.assertEqual(query["stale_reason"], "room_light_missing")
         self.assertEqual(query["evidence"]["reason"], "room_light_missing")
 
@@ -322,6 +359,8 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertEqual(query["state"], "on")
         self.assertEqual(query["confidence_label"], "none")
         self.assertEqual(query["stale_reason"], "room_light_stale")
+        self.assertEqual(query["freshness"]["level"], "stale")
+        self.assertEqual(query["freshness"]["reason"], "age_exceeds_ttl")
         self.assertIn("古く", query["answer_hint"])
 
     def test_camera_sword_sign_topic_preserves_primary_and_best_gesture(self) -> None:

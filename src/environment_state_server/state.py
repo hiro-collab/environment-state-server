@@ -23,6 +23,7 @@ CAPABILITIES = {
     "indicators": True,
     "camera_hub_snapshots": True,
     "vision_topic_snapshots": True,
+    "freshness": True,
 }
 
 
@@ -204,9 +205,11 @@ class EnvironmentStateStore:
         for item in appliances.values():
             updated = parse_optional_timestamp(item.get("updated_at"))
             item["stale"] = True if updated is None else _is_stale(updated, current_time, ttl_seconds)
+            item["freshness"] = _freshness(updated, current_time, ttl_seconds)
         for item in vision.values():
             updated = parse_optional_timestamp(item.get("updated_at"))
             item["stale"] = True if updated is None else _is_stale(updated, current_time, ttl_seconds)
+            item["freshness"] = _freshness(updated, current_time, ttl_seconds)
 
         state_queries = _state_queries_from_vision(vision)
         actions = build_action_registry(appliances)
@@ -252,6 +255,7 @@ class EnvironmentStateStore:
             "observed_at": observed_iso,
             "age_ms": age_ms,
             "stale": stale,
+            "freshness": _freshness(observed_at, current_time, ttl_seconds),
             "ttl_ms": self.ttl_ms,
             "appliances": appliances,
             "actions": actions,
@@ -362,6 +366,42 @@ def _age_ms(updated_at: datetime | None, now: datetime) -> int | None:
     return max(0, int((now - updated_at).total_seconds() * 1000))
 
 
+def _freshness(
+    updated_at: datetime | None,
+    now: datetime,
+    ttl_seconds: float,
+) -> dict[str, Any]:
+    ttl_ms = max(0, int(ttl_seconds * 1000))
+    age_ms = _age_ms(updated_at, now)
+    if updated_at is None or age_ms is None:
+        return {
+            "level": "stale",
+            "age_ms": None,
+            "ttl_ms": ttl_ms,
+            "updated_at": None,
+            "reason": "missing_timestamp",
+        }
+    if age_ms > ttl_ms:
+        level = "stale"
+        reason = "age_exceeds_ttl"
+    elif age_ms <= max(1, int(ttl_ms * 0.4)):
+        level = "fresh"
+        reason = "age_within_fresh_window"
+    elif age_ms <= max(1, int(ttl_ms * 0.8)):
+        level = "recent"
+        reason = "age_within_recent_window"
+    else:
+        level = "usable"
+        reason = "age_within_usable_window"
+    return {
+        "level": level,
+        "age_ms": age_ms,
+        "ttl_ms": ttl_ms,
+        "updated_at": to_iso(updated_at),
+        "reason": reason,
+    }
+
+
 def _snapshot_id(now: datetime, sequence: int) -> str:
     return f"env_{now.strftime('%Y%m%d_%H%M%S')}_{sequence:06d}"
 
@@ -380,6 +420,7 @@ def _source_state(
             "updated_at": None,
             "last_seen_at": None,
             "age_ms": None,
+            "freshness": _freshness(None, now, ttl_seconds),
             "last_error": last_error,
         }
     stale = _is_stale(updated_at, now, ttl_seconds)
@@ -389,6 +430,7 @@ def _source_state(
         "updated_at": to_iso(updated_at),
         "last_seen_at": to_iso(updated_at),
         "age_ms": _age_ms(updated_at, now),
+        "freshness": _freshness(updated_at, now, ttl_seconds),
         "last_error": last_error,
     }
 
@@ -416,6 +458,7 @@ def _node_source_state(
         "updated_at": to_iso(updated_at) if updated_at is not None else None,
         "last_seen_at": to_iso(updated_at) if updated_at is not None else None,
         "age_ms": _age_ms(updated_at, now),
+        "freshness": _freshness(updated_at, now, source_ttl_seconds),
         "last_error": None if available else str(last_error or detail or status),
         "status": status,
         "phase": node.get("phase"),
@@ -562,6 +605,13 @@ def _room_light_state_query(room_light: object) -> dict[str, Any]:
             "observed_at": None,
             "updated_at": None,
             "source_snapshot_id": "",
+            "freshness": {
+                "level": "stale",
+                "age_ms": None,
+                "ttl_ms": 0,
+                "updated_at": None,
+                "reason": "room_light_missing",
+            },
             "evidence": {
                 "reason": "room_light_missing",
                 "topic": "/vision/room_light/state",
@@ -591,6 +641,7 @@ def _room_light_state_query(room_light: object) -> dict[str, Any]:
         "model": room_light.get("model") if isinstance(room_light.get("model"), dict) else {},
         "sequence": room_light.get("sequence") if isinstance(room_light.get("sequence"), dict) else {},
     }
+    freshness = room_light.get("freshness") if isinstance(room_light.get("freshness"), dict) else {}
 
     return {
         "available": not stale,
@@ -610,6 +661,7 @@ def _room_light_state_query(room_light: object) -> dict[str, Any]:
         "observed_at": room_light.get("observed_at"),
         "updated_at": room_light.get("updated_at"),
         "source_snapshot_id": _room_light_source_snapshot_id(room_light),
+        "freshness": deepcopy(freshness),
         "evidence": evidence,
     }
 

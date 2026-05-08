@@ -351,14 +351,16 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             thread.start()
             try:
                 url = f"http://127.0.0.1:{server.server_port}/feedback/state-query"
+                snapshot_id = datetime.now(UTC).strftime("env_%Y%m%d_%H%M%S_000001")
+                idempotency_key = f"state-query-feedback:conv-1:{snapshot_id}:on"
                 payload = json.dumps(
                     {
                         "type": "state_query_feedback",
                         "target": "room_light",
                         "state_query_id": "room_light",
-                        "idempotency_key": "state-query-feedback:conv-1:env_20260507_141500_000001:on",
-                        "snapshot_id": "env_20260507_141500_000001",
-                        "current_snapshot_id": "env_20260507_141500_000001",
+                        "idempotency_key": idempotency_key,
+                        "snapshot_id": snapshot_id,
+                        "current_snapshot_id": snapshot_id,
                         "predicted_state": "unknown",
                         "predicted_confidence_label": "low",
                         "user_label": "on",
@@ -406,7 +408,7 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 self.assertEqual(record["state_query_id"], "room_light")
                 self.assertEqual(
                     record["idempotency_key"],
-                    "state-query-feedback:conv-1:env_20260507_141500_000001:on",
+                    idempotency_key,
                 )
                 self.assertEqual(record["user_label"], "on")
                 self.assertEqual(record["user_text"], "ついてるよ")
