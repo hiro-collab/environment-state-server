@@ -107,6 +107,98 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_environment_current_projects_room_light_calibration_from_home_assistant(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        observed = datetime.now(UTC)
+        store.ingest_home_assistant_event(
+            {
+                "event": "execute_succeeded",
+                "action_id": "light_on",
+                "execution_id": "exec-light-on",
+                "request_id": "ha-light-on",
+                "executed": True,
+                "status": "submitted",
+                "timestamp": observed.isoformat(),
+                "expected_effect": {
+                    "domain": "switch",
+                    "service": "turn_on",
+                    "entity_id": "switch.raito",
+                    "expected_state": "on",
+                },
+            }
+        )
+        store.ingest_vision_envelope(
+            {
+                "topic": "/vision/room_light/state",
+                "header": {
+                    "seq": 12,
+                    "stamp": observed.timestamp(),
+                    "frame_id": "cam0",
+                },
+                "payload": {
+                    "state": "unknown",
+                    "confidence": 0.1,
+                    "lighting_type": "daylight",
+                    "daylight_state": "present",
+                    "sequence": {"last_frame_id": 12},
+                },
+            },
+            source="vision_snapshot_processor",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            feedback_store = StateQueryFeedbackStore(Path(temp_dir) / "state-query-feedback.jsonl")
+            for index, label in enumerate(["on", "off"] * 6, start=1):
+                feedback_store.append(
+                    {
+                        "target": "room_light",
+                        "state_query_id": "room_light",
+                        "idempotency_key": f"state-query-feedback:test:calibration:{index}:{label}",
+                        "snapshot_id": f"env-calibration-{index}",
+                        "predicted_state": "unknown",
+                        "predicted_confidence_label": "low",
+                        "user_label": label,
+                        "user_text": "ついてる" if label == "on" else "消えてる",
+                        "feedback_reason": "user_correction_after_light_action",
+                        "source_context": "post_light_action",
+                        "action_id": "light_on" if label == "on" else "light_off",
+                        "expected_state": label,
+                    }
+                )
+            server = EnvironmentHttpServer(
+                ("127.0.0.1", 0),
+                store=store,
+                api_token="secret",
+                feedback_store=feedback_store,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/environment/current"
+                request = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+
+                room_light = body["state_queries"]["room_light"]
+                self.assertEqual(room_light["state"], "unknown")
+                self.assertEqual(room_light["confidence_label"], "low")
+                self.assertEqual(room_light["learning"]["level"], "reinforced")
+                self.assertEqual(room_light["effective_state"], "on")
+                self.assertEqual(room_light["effective_confidence_label"], "high")
+                self.assertEqual(
+                    room_light["effective_authority"],
+                    "environment_state_server.calibration.home_assistant",
+                )
+                self.assertTrue(room_light["calibration"]["applied"])
+                self.assertEqual(
+                    room_light["calibration"]["reason"],
+                    "fresh_home_assistant_light_state",
+                )
+                self.assertEqual(room_light["calibration"]["raw_state"], "unknown")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_indicators_current_is_public_and_sanitized(self) -> None:
         store = EnvironmentStateStore()
         server = EnvironmentHttpServer(("127.0.0.1", 0), store=store, api_token="secret")
@@ -626,6 +718,50 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 [problem["code"] for problem in reinforced["learning"]["problems"]],
             )
             self.assertTrue(reinforced["learning"]["ok"])
+
+    def test_state_query_feedback_summary_reports_prediction_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            feedback_store = StateQueryFeedbackStore(Path(temp_dir) / "state-query-feedback.jsonl")
+            feedback_store.append(
+                {
+                    "target": "room_light",
+                    "state_query_id": "room_light",
+                    "idempotency_key": "state-query-feedback:test:quality:match",
+                    "snapshot_id": "env_quality_match",
+                    "predicted_state": "off",
+                    "predicted_confidence_label": "high",
+                    "user_label": "off",
+                    "user_text": "消えてる",
+                    "feedback_reason": "user_correction_after_state_query",
+                    "source_context": "state_query",
+                }
+            )
+            feedback_store.append(
+                {
+                    "target": "room_light",
+                    "state_query_id": "room_light",
+                    "idempotency_key": "state-query-feedback:test:quality:conflict",
+                    "snapshot_id": "env_quality_conflict",
+                    "predicted_state": "off",
+                    "predicted_confidence_label": "high",
+                    "user_label": "on",
+                    "user_text": "ついてる",
+                    "feedback_reason": "user_correction_after_state_query",
+                    "source_context": "state_query",
+                }
+            )
+
+            summary = feedback_store.summary(target="room_light")
+            quality = summary["learning"]["prediction_quality"]
+
+            self.assertEqual(quality["comparable_count"], 2)
+            self.assertEqual(quality["match_count"], 1)
+            self.assertEqual(quality["conflict_count"], 1)
+            self.assertEqual(quality["high_confidence_conflict_count"], 1)
+            self.assertIn(
+                "high_confidence_prediction_conflicts",
+                [problem["code"] for problem in summary["learning"]["problems"]],
+            )
 
     def test_state_query_feedback_accepts_stale_pending_with_warning(self) -> None:
         store = EnvironmentStateStore()

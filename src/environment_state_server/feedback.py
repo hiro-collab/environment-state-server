@@ -273,6 +273,7 @@ def _learning_summary(
     post_action_count = int(source_context_counts.get("post_light_action", 0))
     state_query_count = int(source_context_counts.get("state_query", 0))
     stale_ratio = (warning_count / accepted_count) if accepted_count else 0.0
+    prediction_quality = _prediction_quality(items)
 
     level_index = 0
     if accepted_count >= 1:
@@ -349,6 +350,14 @@ def _learning_summary(
                 "同じ idempotency_key の重複送信が検出されています。",
             )
         )
+    if int(prediction_quality.get("high_confidence_conflict_count", 0)) > 0:
+        problems.append(
+            _learning_problem(
+                "high_confidence_prediction_conflicts",
+                "warning",
+                "高確信のカメラ推定とユーザー訂正が衝突した記録があります。照明判定の閾値や撮影条件を見直してください。",
+            )
+        )
 
     return {
         "target": target,
@@ -369,9 +378,57 @@ def _learning_summary(
         },
         "reason_counts": dict(reason_counts),
         "source_context_counts": dict(source_context_counts),
+        "prediction_quality": prediction_quality,
         "problems": problems,
         "ok": not any(problem["severity"] == "error" for problem in problems),
         "next_level_hint": _next_learning_level_hint(level_index),
+    }
+
+
+def _prediction_quality(items: list[dict[str, Any]]) -> dict[str, Any]:
+    comparable = 0
+    match_count = 0
+    conflict_count = 0
+    high_confidence_count = 0
+    high_confidence_conflict_count = 0
+    recent_conflicts: list[dict[str, str]] = []
+    for item in items:
+        predicted = _room_light_state(item.get("predicted_state"))
+        actual = _room_light_state(item.get("user_label"))
+        confidence = _confidence_label(item.get("predicted_confidence_label"))
+        if predicted not in {"on", "off"} or actual not in {"on", "off"}:
+            continue
+        comparable += 1
+        high_confidence = confidence == "high"
+        if high_confidence:
+            high_confidence_count += 1
+        if predicted == actual:
+            match_count += 1
+            continue
+        conflict_count += 1
+        if high_confidence:
+            high_confidence_conflict_count += 1
+        recent_conflicts.append(
+            {
+                "feedback_id": str(item.get("feedback_id") or ""),
+                "received_at": str(item.get("received_at") or ""),
+                "predicted_state": predicted,
+                "predicted_confidence_label": confidence,
+                "user_label": actual,
+                "snapshot_id": str(item.get("snapshot_id") or ""),
+            }
+        )
+    match_ratio = (match_count / comparable) if comparable else 0.0
+    conflict_ratio = (conflict_count / comparable) if comparable else 0.0
+    return {
+        "comparable_count": comparable,
+        "match_count": match_count,
+        "conflict_count": conflict_count,
+        "match_ratio": round(match_ratio, 4),
+        "conflict_ratio": round(conflict_ratio, 4),
+        "high_confidence_count": high_confidence_count,
+        "high_confidence_conflict_count": high_confidence_conflict_count,
+        "recent_conflicts": recent_conflicts[-5:],
     }
 
 
