@@ -50,6 +50,8 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertEqual(light_off["pre_action_phrase"], "電気を消す")
         self.assertEqual(light_off["risk_level"], "low")
         self.assertEqual(light_off["confirmation_policy"]["requires_confirmation"], False)
+        self.assertEqual(light_off["recheck_visibility"]["status"], "observable")
+        self.assertEqual(light_off["recheck_visibility"]["entity_id"], "switch.raito")
         self.assertIn("電気を消して", light_off["aliases"])
         self.assertIn("capabilities", current)
         self.assertTrue(current["capabilities"]["actions"])
@@ -102,6 +104,30 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertEqual(vacuum_start["risk_level"], "medium")
         self.assertTrue(vacuum_start["confirmation_policy"]["requires_confirmation"])
         self.assertEqual(vacuum_start["confirmation_policy"]["reason"], "vacuum_motion")
+
+    def test_aircon_actions_expose_unverified_recheck_visibility(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+
+        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
+        actions = {action["action_id"]: action for action in current["actions"]}
+
+        aircon_off = actions["aircon_off"]
+        self.assertEqual(
+            aircon_off["recheck_visibility"]["status"],
+            "known_gap",
+        )
+        self.assertEqual(
+            aircon_off["recheck_visibility"]["evidence_class"],
+            "action_event_only",
+        )
+        self.assertEqual(
+            aircon_off["recheck_visibility"]["physical_state_source"],
+            "not_supported",
+        )
+        self.assertEqual(
+            aircon_off["recheck_visibility"]["unverified_state_label"],
+            "submitted_unverified",
+        )
 
     def test_ttl_marks_state_stale(self) -> None:
         store = EnvironmentStateStore(ttl_ms=1000)

@@ -80,7 +80,6 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
             "ドア止めて",
             "扉を止めて",
             "扉止めて",
-            "停止して",
         ),
         target_label="中扉",
         verb="止める",
@@ -202,7 +201,12 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="climate_control",
         risk_level="medium",
         expected_state="on",
-        expected_effect={"expected_state": "on"},
+        expected_effect={
+            "expected_state": "on",
+            "evidence_class": "action_event_only",
+            "physical_state_source": "not_supported",
+            "unverified_state_label": "submitted_unverified",
+        },
     ),
     ActionDefinition(
         action_id="aircon_off",
@@ -231,7 +235,12 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="climate_control",
         risk_level="medium",
         expected_state="off",
-        expected_effect={"expected_state": "off"},
+        expected_effect={
+            "expected_state": "off",
+            "evidence_class": "action_event_only",
+            "physical_state_source": "not_supported",
+            "unverified_state_label": "submitted_unverified",
+        },
     ),
     ActionDefinition(
         action_id="vacuum_start",
@@ -328,10 +337,46 @@ def _action_payload(
         "current_state": current_state,
         "expected_state": action.expected_state,
         "expected_effect": dict(action.expected_effect),
+        "recheck_visibility": _recheck_visibility(action),
         "available": available,
         "noop": noop,
         "reason": reason,
         "reason_text": _reason_text(action, reason),
+    }
+
+
+def _recheck_visibility(action: ActionDefinition) -> dict[str, Any]:
+    effect = action.expected_effect
+    physical_state_source = str(effect.get("physical_state_source") or "").strip()
+    evidence_class = str(effect.get("evidence_class") or "").strip()
+    entity_id = str(effect.get("entity_id") or "").strip()
+    domain = str(effect.get("domain") or "").strip()
+
+    if physical_state_source == "not_supported":
+        return {
+            "status": "known_gap",
+            "structured_signal": "action_registry.expected_effect",
+            "evidence_class": evidence_class or "action_event_only",
+            "physical_state_source": "not_supported",
+            "unverified_state_label": effect.get("unverified_state_label") or "submitted_unverified",
+            "review_note": "physical_state_not_observable_from_environment_state",
+        }
+
+    if entity_id:
+        return {
+            "status": "observable",
+            "structured_signal": "home_assistant.entity_state",
+            "evidence_class": evidence_class or "physical_state_supported",
+            "physical_state_source": physical_state_source or "home_assistant",
+            "entity_id": entity_id,
+            "domain": domain,
+        }
+
+    return {
+        "status": "unmapped",
+        "structured_signal": "action_registry.expected_state",
+        "evidence_class": evidence_class or "expected_state_only",
+        "physical_state_source": physical_state_source or "not_declared",
     }
 
 
