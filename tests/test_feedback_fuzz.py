@@ -133,6 +133,45 @@ class EnvironmentFeedbackFuzzTest(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_feedback_endpoint_normalizes_non_finite_numbers_before_appending(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            feedback_path = Path(temp_dir) / "feedback.jsonl"
+            server, thread = self._start_server(feedback_path)
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/feedback/state-query"
+                payload = {
+                    "target": "room_light",
+                    "state_query_id": "room_light",
+                    "idempotency_key": "state-query-feedback:fuzz:non-finite",
+                    "snapshot_id": "env_20260530_102117_000001",
+                    "predicted_state": "unknown",
+                    "predicted_confidence_label": "low",
+                    "user_label": "on",
+                    "source": "fuzz",
+                    "workflow_version": "communication-fuzz",
+                    "feedback_reason": "user_correction_after_state_query",
+                    "source_context": "state_query",
+                    "pending": {
+                        "evidence": {
+                            "electric_on_probability": float("nan"),
+                            "confidence": float("inf"),
+                        }
+                    },
+                }
+
+                status, body = self._post_json(url, payload)
+
+                self.assertEqual(status, 200)
+                self.assertTrue(body["ok"])
+                record = json.loads(feedback_path.read_text(encoding="utf-8").splitlines()[0])
+                evidence = record["pending"]["evidence"]
+                self.assertIsNone(evidence["electric_on_probability"])
+                self.assertIsNone(evidence["confidence"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_feedback_recent_ignores_bad_lines_and_bounds_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             feedback_path = Path(temp_dir) / "feedback.jsonl"

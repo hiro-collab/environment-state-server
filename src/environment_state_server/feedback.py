@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import unicodedata
@@ -530,8 +531,10 @@ def _json_safe(value: object, *, max_depth: int) -> object:
         return None
     if value is None or isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
+    if isinstance(value, int) and not isinstance(value, bool):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, str):
         return _short_text(value, max_length=MAX_STRING_LENGTH)
     if isinstance(value, dict):
