@@ -11,7 +11,31 @@ Dify 判断用の state snapshot と、表示用 indicator snapshot を返すロ
 
 このサーバーは物理カメラを開きません。gesture 推論も映像配信も担当しません。
 
-## Start
+## 初期セットアップ
+
+```powershell
+uv sync
+uv run python -m unittest discover -s tests
+```
+
+この organ は Camera Hub、Vision Snapshot Processor、Home Assistant bridge などの状態を集約します。
+単体で物理カメラや家電を初期化するものではありません。
+
+## dotenv / local config
+
+この repo 自身には標準の `.env.example` はありません。通常は Home Assistant bridge の
+`.env` を `uv run --env-file ..\home-assistant-server\.env ...` で読みます。
+
+必要な token:
+
+- `ENVIRONMENT_API_TOKEN`: Environment API 専用 token。未設定なら Home Assistant bridge の
+  `HOME_CONTROL_API_TOKEN` を共有できます。
+- `HOME_CONTROL_API_TOKEN`: Dify / Thought Core / AITuberKit などが local bridge に送る token。
+- `HOME_ASSISTANT_TOKEN`: Home Assistant bridge 側で使う長期 access token。
+
+実 token、feedback JSONL、`.cache/`、`.venv/` はコミットしません。
+
+## 通常起動
 
 ```powershell
 cd <workspace>\environment-state-server
