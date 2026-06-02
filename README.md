@@ -24,7 +24,10 @@ uv run python -m unittest discover -s tests
 ## dotenv / local config
 
 この repo 自身には標準の `.env.example` はありません。通常は Home Assistant bridge の
-`.env` を `uv run --env-file ..\home-assistant-server\.env ...` で読みます。
+`.env` を `uv run --env-file <home-assistant-server/.env> ...` で読みます。
+Windows では `uv --env-file` に backslash の相対 path を渡すと path が崩れることが
+あるため、PowerShell では `Resolve-Path` した絶対 path を forward slash 化して
+渡してください。
 
 必要な token:
 
@@ -39,7 +42,8 @@ uv run python -m unittest discover -s tests
 
 ```powershell
 cd <workspace>\environment-state-server
-uv run --env-file ..\home-assistant-server\.env python -m environment_state_server.main `
+$HomeControlEnv = (Resolve-Path ..\home-assistant-server\.env).Path -replace "\\", "/"
+uv run --env-file $HomeControlEnv python -m environment_state_server.main `
   --host 127.0.0.1 `
   --port 8790 `
   --state-query-feedback-path .cache\environment_state_server\state_query_feedback.jsonl `
