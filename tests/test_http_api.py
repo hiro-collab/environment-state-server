@@ -122,7 +122,7 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 "expected_effect": {
                     "domain": "switch",
                     "service": "turn_on",
-                    "entity_id": "switch.raito",
+                    "entity_id": "switch.demo_light",
                     "expected_state": "on",
                 },
             }

@@ -511,6 +511,10 @@ def _appliance_from_home_assistant_event(
         return None
     action_id = str(event.get("action_id") or "")
     effect = event.get("expected_effect") if isinstance(event.get("expected_effect"), dict) else None
+    if effect is None:
+        return None
+    if _effect_requires_external_observation(effect):
+        return None
     key = _appliance_key(action_id, effect)
     state = _appliance_state(action_id, effect)
     if key is None or state is None:
@@ -529,6 +533,19 @@ def _appliance_from_home_assistant_event(
         payload["entity_id"] = effect.get("entity_id")
         payload["expected_state"] = effect.get("expected_state")
     return key, payload
+
+
+def _effect_requires_external_observation(effect: dict[str, Any] | None) -> bool:
+    if not effect:
+        return False
+    physical_state_source = str(effect.get("physical_state_source") or "").strip()
+    verification_mode = str(effect.get("verification_mode") or "").strip()
+    state_authority = str(effect.get("state_authority") or "").strip()
+    return (
+        physical_state_source == "not_supported"
+        or verification_mode == "external_observation"
+        or state_authority == "open_loop"
+    )
 
 
 def _appliance_key(action_id: str, effect: dict[str, Any] | None) -> str | None:

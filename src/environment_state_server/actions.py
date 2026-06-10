@@ -110,10 +110,13 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         risk_level="low",
         expected_state="on",
         expected_effect={
-            "domain": "switch",
-            "service": "turn_on",
-            "entity_id": "switch.raito",
             "expected_state": "on",
+            "control_type": "stateless_toggle",
+            "state_authority": "open_loop",
+            "verification_mode": "external_observation",
+            "evidence_class": "external_observation_required",
+            "physical_state_source": "not_supported",
+            "unverified_state_label": "open_loop_toggle_submitted",
         },
     ),
     ActionDefinition(
@@ -136,10 +139,13 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         risk_level="low",
         expected_state="off",
         expected_effect={
-            "domain": "switch",
-            "service": "turn_off",
-            "entity_id": "switch.raito",
             "expected_state": "off",
+            "control_type": "stateless_toggle",
+            "state_authority": "open_loop",
+            "verification_mode": "external_observation",
+            "evidence_class": "external_observation_required",
+            "physical_state_source": "not_supported",
+            "unverified_state_label": "open_loop_toggle_submitted",
         },
     ),
     ActionDefinition(

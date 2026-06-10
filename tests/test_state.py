@@ -21,7 +21,7 @@ class EnvironmentStateStoreTest(unittest.TestCase):
                 "expected_effect": {
                     "domain": "switch",
                     "service": "turn_off",
-                    "entity_id": "switch.raito",
+                    "entity_id": "switch.demo_light",
                     "expected_state": "off",
                 },
             }
@@ -50,13 +50,21 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertEqual(light_off["pre_action_phrase"], "電気を消す")
         self.assertEqual(light_off["risk_level"], "low")
         self.assertEqual(light_off["confirmation_policy"]["requires_confirmation"], False)
-        self.assertEqual(light_off["recheck_visibility"]["status"], "observable")
-        self.assertEqual(light_off["recheck_visibility"]["entity_id"], "switch.raito")
+        self.assertEqual(light_off["recheck_visibility"]["status"], "known_gap")
+        self.assertEqual(
+            light_off["recheck_visibility"]["evidence_class"],
+            "external_observation_required",
+        )
+        self.assertEqual(
+            light_off["recheck_visibility"]["physical_state_source"],
+            "not_supported",
+        )
+        self.assertNotIn("entity_id", light_off["recheck_visibility"])
         self.assertIn("電気を消して", light_off["aliases"])
         self.assertIn("capabilities", current)
         self.assertTrue(current["capabilities"]["actions"])
 
-    def test_door_action_is_normalized_without_expected_effect(self) -> None:
+    def test_action_without_expected_effect_does_not_create_appliance_state(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         store.ingest_home_assistant_event(
             {
@@ -70,7 +78,30 @@ class EnvironmentStateStoreTest(unittest.TestCase):
 
         current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
 
-        self.assertEqual(current["appliances"]["door"]["state"], "closed")
+        self.assertNotIn("door", current["appliances"])
+
+    def test_external_observation_light_event_does_not_create_appliance_state(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        store.ingest_home_assistant_event(
+            {
+                "event": "execute_succeeded",
+                "action_id": "light_on",
+                "execution_id": "exec-light-open-loop",
+                "executed": True,
+                "timestamp": "2026-05-06T14:00:00+00:00",
+                "expected_effect": {
+                    "expected_state": "on",
+                    "control_type": "stateless_toggle",
+                    "state_authority": "open_loop",
+                    "verification_mode": "external_observation",
+                    "physical_state_source": "not_supported",
+                },
+            }
+        )
+
+        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
+
+        self.assertNotIn("light", current["appliances"])
 
     def test_action_registry_includes_aircon_and_vacuum_actions(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
@@ -80,6 +111,11 @@ class EnvironmentStateStoreTest(unittest.TestCase):
                 "action_id": "vacuum_start",
                 "executed": True,
                 "timestamp": "2026-05-06T14:00:00+00:00",
+                "expected_effect": {
+                    "domain": "vacuum",
+                    "entity_id": "vacuum.demo",
+                    "expected_state": "cleaning",
+                },
             }
         )
 
@@ -137,6 +173,11 @@ class EnvironmentStateStoreTest(unittest.TestCase):
                 "action_id": "fan_on",
                 "executed": True,
                 "timestamp": "2026-05-06T14:00:00+00:00",
+                "expected_effect": {
+                    "domain": "fan",
+                    "entity_id": "fan.demo",
+                    "expected_state": "on",
+                },
             }
         )
 
@@ -160,6 +201,11 @@ class EnvironmentStateStoreTest(unittest.TestCase):
                 "action_id": "fan_on",
                 "executed": True,
                 "timestamp": "2026-05-06T14:00:00+00:00",
+                "expected_effect": {
+                    "domain": "fan",
+                    "entity_id": "fan.demo",
+                    "expected_state": "on",
+                },
             }
         )
 
