@@ -103,6 +103,53 @@ class EnvironmentStateStoreTest(unittest.TestCase):
 
         self.assertNotIn("light", current["appliances"])
 
+    def test_command_ack_only_event_does_not_create_appliance_state(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        store.ingest_home_assistant_event(
+            {
+                "event": "execute_succeeded",
+                "action_id": "fan_on",
+                "execution_id": "exec-fan-command-only",
+                "executed": True,
+                "timestamp": "2026-05-06T14:00:00+00:00",
+                "expected_effect": {
+                    "expected_state": "on",
+                    "control_type": "stateless_command",
+                    "state_authority": "submitted_only",
+                    "verification_mode": "command_ack_only",
+                    "evidence_class": "command_ack_only",
+                    "physical_state_source": "not_supported",
+                },
+            }
+        )
+
+        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
+
+        self.assertNotIn("fan", current["appliances"])
+
+    def test_ha_state_expected_effect_uses_expected_state_not_action_suffix(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        store.ingest_home_assistant_event(
+            {
+                "event": "execute_succeeded",
+                "action_id": "vacuum_return",
+                "execution_id": "exec-vacuum-return",
+                "executed": True,
+                "timestamp": "2026-05-06T14:00:00+00:00",
+                "expected_effect": {
+                    "domain": "vacuum",
+                    "entity_id": "vacuum.demo",
+                    "expected_state": "docked",
+                    "state_authority": "ha_entity",
+                    "verification_mode": "ha_state",
+                },
+            }
+        )
+
+        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
+
+        self.assertEqual(current["appliances"]["vacuum"]["state"], "docked")
+
     def test_action_registry_includes_aircon_and_vacuum_actions(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         store.ingest_home_assistant_event(
@@ -154,7 +201,7 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         )
         self.assertEqual(
             aircon_off["recheck_visibility"]["evidence_class"],
-            "action_event_only",
+            "command_ack_only",
         )
         self.assertEqual(
             aircon_off["recheck_visibility"]["physical_state_source"],

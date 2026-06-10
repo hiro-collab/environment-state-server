@@ -20,6 +20,30 @@ class ActionDefinition:
     expected_effect: dict[str, Any]
 
 
+def _command_only_effect(expected_state: str, *, control_type: str) -> dict[str, Any]:
+    return {
+        "expected_state": expected_state,
+        "control_type": control_type,
+        "state_authority": "submitted_only",
+        "verification_mode": "command_ack_only",
+        "evidence_class": "command_ack_only",
+        "physical_state_source": "not_supported",
+        "unverified_state_label": "submitted_unverified",
+    }
+
+
+def _open_loop_effect(expected_state: str) -> dict[str, Any]:
+    return {
+        "expected_state": expected_state,
+        "control_type": "stateless_toggle",
+        "state_authority": "open_loop",
+        "verification_mode": "external_observation",
+        "evidence_class": "external_observation_required",
+        "physical_state_source": "not_supported",
+        "unverified_state_label": "open_loop_toggle_submitted",
+    }
+
+
 ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
     ActionDefinition(
         action_id="door_open",
@@ -42,7 +66,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="door_motion",
         risk_level="medium",
         expected_state="open",
-        expected_effect={"expected_state": "open"},
+        expected_effect=_command_only_effect("open", control_type="position_command"),
     ),
     ActionDefinition(
         action_id="door_close",
@@ -67,7 +91,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="door_motion",
         risk_level="medium",
         expected_state="closed",
-        expected_effect={"expected_state": "closed"},
+        expected_effect=_command_only_effect("closed", control_type="position_command"),
     ),
     ActionDefinition(
         action_id="door_stop",
@@ -88,7 +112,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="door_motion",
         risk_level="medium",
         expected_state="stopped",
-        expected_effect={"expected_state": "stopped"},
+        expected_effect=_command_only_effect("stopped", control_type="position_command"),
     ),
     ActionDefinition(
         action_id="light_on",
@@ -109,15 +133,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason=None,
         risk_level="low",
         expected_state="on",
-        expected_effect={
-            "expected_state": "on",
-            "control_type": "stateless_toggle",
-            "state_authority": "open_loop",
-            "verification_mode": "external_observation",
-            "evidence_class": "external_observation_required",
-            "physical_state_source": "not_supported",
-            "unverified_state_label": "open_loop_toggle_submitted",
-        },
+        expected_effect=_open_loop_effect("on"),
     ),
     ActionDefinition(
         action_id="light_off",
@@ -138,15 +154,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason=None,
         risk_level="low",
         expected_state="off",
-        expected_effect={
-            "expected_state": "off",
-            "control_type": "stateless_toggle",
-            "state_authority": "open_loop",
-            "verification_mode": "external_observation",
-            "evidence_class": "external_observation_required",
-            "physical_state_source": "not_supported",
-            "unverified_state_label": "open_loop_toggle_submitted",
-        },
+        expected_effect=_open_loop_effect("off"),
     ),
     ActionDefinition(
         action_id="fan_on",
@@ -165,7 +173,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason=None,
         risk_level="low",
         expected_state="on",
-        expected_effect={"expected_state": "on"},
+        expected_effect=_command_only_effect("on", control_type="stateless_command"),
     ),
     ActionDefinition(
         action_id="fan_off",
@@ -185,7 +193,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason=None,
         risk_level="low",
         expected_state="off",
-        expected_effect={"expected_state": "off"},
+        expected_effect=_command_only_effect("off", control_type="stateless_command"),
     ),
     ActionDefinition(
         action_id="aircon_on",
@@ -207,12 +215,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="climate_control",
         risk_level="medium",
         expected_state="on",
-        expected_effect={
-            "expected_state": "on",
-            "evidence_class": "action_event_only",
-            "physical_state_source": "not_supported",
-            "unverified_state_label": "submitted_unverified",
-        },
+        expected_effect=_command_only_effect("on", control_type="stateless_command"),
     ),
     ActionDefinition(
         action_id="aircon_off",
@@ -241,12 +244,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="climate_control",
         risk_level="medium",
         expected_state="off",
-        expected_effect={
-            "expected_state": "off",
-            "evidence_class": "action_event_only",
-            "physical_state_source": "not_supported",
-            "unverified_state_label": "submitted_unverified",
-        },
+        expected_effect=_command_only_effect("off", control_type="stateless_command"),
     ),
     ActionDefinition(
         action_id="vacuum_start",
@@ -267,7 +265,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="vacuum_motion",
         risk_level="medium",
         expected_state="cleaning",
-        expected_effect={"expected_state": "cleaning"},
+        expected_effect=_command_only_effect("cleaning", control_type="job_command"),
     ),
     ActionDefinition(
         action_id="vacuum_return",
@@ -288,7 +286,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="vacuum_motion",
         risk_level="medium",
         expected_state="returning",
-        expected_effect={"expected_state": "returning"},
+        expected_effect=_command_only_effect("returning", control_type="job_command"),
     ),
     ActionDefinition(
         action_id="vacuum_pause",
@@ -309,7 +307,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="vacuum_motion",
         risk_level="medium",
         expected_state="paused",
-        expected_effect={"expected_state": "paused"},
+        expected_effect=_command_only_effect("paused", control_type="job_command"),
     ),
 )
 

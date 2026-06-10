@@ -541,10 +541,14 @@ def _effect_requires_external_observation(effect: dict[str, Any] | None) -> bool
     physical_state_source = str(effect.get("physical_state_source") or "").strip()
     verification_mode = str(effect.get("verification_mode") or "").strip()
     state_authority = str(effect.get("state_authority") or "").strip()
+    evidence_class = str(effect.get("evidence_class") or "").strip()
     return (
         physical_state_source == "not_supported"
         or verification_mode == "external_observation"
+        or verification_mode == "command_ack_only"
         or state_authority == "open_loop"
+        or state_authority == "submitted_only"
+        or evidence_class in {"action_event_only", "command_ack_only"}
     )
 
 
@@ -570,6 +574,11 @@ def _appliance_key(action_id: str, effect: dict[str, Any] | None) -> str | None:
 
 
 def _appliance_state(action_id: str, effect: dict[str, Any] | None) -> str | None:
+    if effect is not None:
+        expected_state = str(effect.get("expected_state") or "").strip()
+        if expected_state:
+            return expected_state
+
     lowered = action_id.lower()
     if lowered.startswith("door_"):
         if lowered.endswith("_open"):
