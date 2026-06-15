@@ -7,15 +7,20 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
-from .actions import build_action_registry
+from .actions import action_readiness_summary, build_action_registry, public_action_summaries
 
 
 SCHEMA_VERSION = 1
 HOME_ASSISTANT_SOURCE = "home_assistant"
 HOME_ASSISTANT_EVENTS_SOURCE = "home_assistant_events"
 HOME_ASSISTANT_BRIDGE_SOURCE = "home_assistant_bridge"
+HOME_CONTROL_READONLY_SOURCE = "home_control_readonly"
 CAMERA_HUB_SOURCE = "camera_hub"
 VISION_SNAPSHOT_PROCESSOR_SOURCE = "vision_snapshot_processor"
+AIRCON_STATUS_QUERY_ID = "aircon_current_status"
+AIRCON_STATUS_SOURCE_CLASS = "Home_Control_HA_visible_tracked_climate"
+AIRCON_STATUS_AUTHORITY = "home_control_ha_readonly_climate"
+AIRCON_STATUS_PROOF_CEILING = "HA_visible_climate_state_only"
 CAPABILITIES = {
     "actions": True,
     "relations": True,
@@ -24,6 +29,7 @@ CAPABILITIES = {
     "camera_hub_snapshots": True,
     "vision_topic_snapshots": True,
     "freshness": True,
+    AIRCON_STATUS_QUERY_ID: True,
 }
 
 
@@ -97,6 +103,24 @@ class EnvironmentStateStore:
             self._source_errors[HOME_ASSISTANT_EVENTS_SOURCE] = None
             self._last_home_assistant_events.append(summary)
             self._last_home_assistant_events = self._last_home_assistant_events[-self.max_events :]
+            if appliance is not None:
+                key, payload = appliance
+                self._appliances[key] = payload
+
+    def ingest_home_control_action_state(self, action_state: dict[str, Any]) -> None:
+        if not isinstance(action_state, dict):
+            return
+        observed = parse_timestamp(
+            action_state.get("observed_at")
+            or action_state.get("checked_at")
+            or action_state.get("timestamp")
+        )
+        appliance = _appliance_from_home_control_action_state(action_state, observed)
+        last_error = _home_control_action_state_error(action_state, appliance is not None)
+
+        with self._lock:
+            self._source_updates[HOME_CONTROL_READONLY_SOURCE] = observed
+            self._source_errors[HOME_CONTROL_READONLY_SOURCE] = last_error
             if appliance is not None:
                 key, payload = appliance
                 self._appliances[key] = payload
@@ -211,8 +235,9 @@ class EnvironmentStateStore:
             item["stale"] = True if updated is None else _is_stale(updated, current_time, ttl_seconds)
             item["freshness"] = _freshness(updated, current_time, ttl_seconds)
 
-        state_queries = _state_queries_from_vision(vision)
         actions = build_action_registry(appliances)
+        state_queries = _state_queries_from_environment(vision, appliances, actions)
+        action_readiness = action_readiness_summary(actions)
         sources = {
             HOME_ASSISTANT_SOURCE: _node_source_state(
                 nodes.get(HOME_ASSISTANT_BRIDGE_SOURCE),
@@ -259,6 +284,7 @@ class EnvironmentStateStore:
             "ttl_ms": self.ttl_ms,
             "appliances": appliances,
             "actions": actions,
+            "action_readiness": action_readiness,
             "vision": vision,
             "state_queries": state_queries,
             "last_home_assistant_events": events,
@@ -301,7 +327,8 @@ class EnvironmentStateStore:
             "environment": {
                 "ttl_ms": environment.get("ttl_ms"),
                 "appliances": environment.get("appliances", {}),
-                "actions": environment.get("actions", []),
+                "actions": public_action_summaries(environment.get("actions", [])),
+                "action_readiness": environment.get("action_readiness", {}),
                 "vision": environment.get("vision", {}),
                 "state_queries": environment.get("state_queries", {}),
                 "sources": environment.get("sources", {}),
@@ -535,6 +562,70 @@ def _appliance_from_home_assistant_event(
     return key, payload
 
 
+def _appliance_from_home_control_action_state(
+    action_state: dict[str, Any],
+    observed: datetime,
+) -> tuple[str, dict[str, Any]] | None:
+    action_id = str(action_state.get("action_id") or "").strip()
+    if not action_id:
+        return None
+    if not action_id.startswith("aircon_"):
+        return None
+    if str(action_state.get("state_tracking") or "").strip() != "tracked":
+        return None
+    if str(action_state.get("verification_mode") or "").strip() != "ha_state":
+        return None
+    if str(action_state.get("state_authority") or "").strip() != "ha_entity":
+        return None
+
+    actual_state = _aircon_state(action_state.get("actual_state"))
+    if actual_state in {"unknown", "unavailable"}:
+        return None
+
+    expected_states = action_state.get("expected_states")
+    safe_expected_states = [
+        _aircon_state(item)
+        for item in expected_states
+        if _aircon_state(item) not in {"unknown", "unavailable"}
+    ] if isinstance(expected_states, list) else []
+
+    payload: dict[str, Any] = {
+        "state": actual_state,
+        "updated_at": to_iso(observed),
+        "source": HOME_CONTROL_READONLY_SOURCE,
+        "source_class": AIRCON_STATUS_SOURCE_CLASS,
+        "action_id": action_id,
+        "checkstate_status": _home_control_checkstate_status(action_state.get("status")),
+        "expected_state": _aircon_state(action_state.get("expected_state")),
+        "expected_states": safe_expected_states,
+        "control_type": str(action_state.get("control_type") or "mode_command"),
+        "state_authority": "ha_entity",
+        "verification_mode": "ha_state",
+        "state_tracking": "tracked",
+        "proof_ceiling": str(action_state.get("proof_ceiling") or AIRCON_STATUS_PROOF_CEILING),
+    }
+    return "aircon", payload
+
+
+def _home_control_action_state_error(
+    action_state: dict[str, Any],
+    registered: bool,
+) -> str | None:
+    if registered:
+        return None
+    status = _home_control_checkstate_status(action_state.get("status"))
+    if status in {"poll_error", "unavailable", "unsupported", "ack_only", "external_required"}:
+        return f"aircon_current_status_{status}"
+    if not str(action_state.get("actual_state") or "").strip():
+        return "aircon_current_status_missing_actual_state"
+    return None
+
+
+def _home_control_checkstate_status(value: object) -> str:
+    status = str(value or "").strip().lower()
+    return status if status else "unknown"
+
+
 def _effect_requires_external_observation(effect: dict[str, Any] | None) -> bool:
     if not effect:
         return False
@@ -611,10 +702,247 @@ def _appliance_state(action_id: str, effect: dict[str, Any] | None) -> str | Non
     return None
 
 
-def _state_queries_from_vision(vision: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _state_queries_from_environment(
+    vision: dict[str, dict[str, Any]],
+    appliances: dict[str, dict[str, Any]],
+    actions: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "room_light": _room_light_state_query(vision.get("room_light")),
+        AIRCON_STATUS_QUERY_ID: _aircon_status_query(appliances.get("aircon"), actions),
     }
+
+
+def _aircon_status_query(aircon: object, actions: list[dict[str, Any]]) -> dict[str, Any]:
+    tracked_action_ids = _tracked_aircon_action_ids(actions)
+    base = {
+        "schema_version": "environment_state_aircon_current_status.v0",
+        "authority": AIRCON_STATUS_AUTHORITY,
+        "projected_by": "environment_state_server",
+        "source_class": AIRCON_STATUS_SOURCE_CLASS,
+        "proof_ceiling": AIRCON_STATUS_PROOF_CEILING,
+        "does_not_prove": [
+            "physical_hvac_comfort",
+            "physical_HVAC_cooling_or_comfort",
+            "physical_cooling_or_airflow",
+            "home_control_action_success",
+            "command_acceptance",
+            "home_control_pass",
+            "rr003_review_ready_or_pass",
+        ],
+    }
+    if not isinstance(aircon, dict):
+        return {
+            **base,
+            "available": False,
+            "stale": True,
+            "stale_reason": "aircon_current_status_missing",
+            "state": "unknown",
+            "current_status": "unknown",
+            "state_is_last_known": False,
+            "appliance_family": "aircon",
+            "status_availability_class": "unavailable",
+            "status_match_class": "unknown",
+            "freshness_class": "unavailable",
+            "safe_wording_class": "current_ac_status_unavailable_must_revalidate_current_state",
+            "status_label": "unavailable",
+            "answer_hint": "現在のEnvironment Stateではエアコンの現在状態を確認できない。再取得が必要です。",
+            "observed_at": None,
+            "updated_at": None,
+            "freshness": {
+                "level": "stale",
+                "age_ms": None,
+                "ttl_ms": 0,
+                "updated_at": None,
+                "reason": "aircon_current_status_missing",
+            },
+            "evidence": {
+                "reason": "aircon_current_status_missing",
+                "source_class": AIRCON_STATUS_SOURCE_CLASS,
+                "tracked_action_ids": tracked_action_ids,
+                "state_authority": "ha_entity",
+                "verification_mode": "ha_state",
+                "state_tracking": "tracked",
+                "checkstate_class": "not_registered",
+            },
+        }
+
+    stale = bool(aircon.get("stale", True))
+    state = _aircon_state(aircon.get("state"))
+    freshness = aircon.get("freshness") if isinstance(aircon.get("freshness"), dict) else {}
+    checkstate_status = _home_control_checkstate_status(aircon.get("checkstate_status"))
+    available = not stale and state not in {"unknown", "unavailable"}
+    stale_reason = "aircon_current_status_stale" if stale else ""
+    if state in {"unknown", "unavailable"}:
+        available = False
+        stale_reason = stale_reason or "aircon_current_status_unknown"
+    status_availability_class = (
+        "available_fresh"
+        if available
+        else "available_stale"
+        if state not in {"unknown", "unavailable"}
+        else "unavailable"
+    )
+
+    return {
+        **base,
+        "available": available,
+        "stale": stale,
+        "stale_reason": stale_reason,
+        "state": state,
+        "current_status": state,
+        "state_is_last_known": bool(stale and state not in {"unknown", "unavailable"}),
+        "appliance_family": "aircon",
+        "status_availability_class": status_availability_class,
+        "status_match_class": _aircon_status_match_class(
+            action_id=str(aircon.get("action_id") or ""),
+            state=state,
+            checkstate_status=checkstate_status,
+        ),
+        "freshness_class": _aircon_freshness_class(freshness, available=available, stale=stale),
+        "safe_wording_class": _aircon_safe_wording_class(
+            available=available,
+            stale=stale,
+            state=state,
+            checkstate_status=checkstate_status,
+        ),
+        "status_label": _aircon_status_label(state),
+        "answer_hint": _aircon_status_answer_hint(
+            available=available,
+            stale=stale,
+            state=state,
+        ),
+        "observed_at": aircon.get("updated_at"),
+        "updated_at": aircon.get("updated_at"),
+        "freshness": deepcopy(freshness),
+        "evidence": {
+            "source": str(aircon.get("source") or HOME_CONTROL_READONLY_SOURCE),
+            "source_class": str(aircon.get("source_class") or AIRCON_STATUS_SOURCE_CLASS),
+            "tracked_action_ids": tracked_action_ids,
+            "checkstate_status": checkstate_status,
+            "expected_state": _aircon_state(aircon.get("expected_state")),
+            "expected_states": [
+                _aircon_state(item)
+                for item in aircon.get("expected_states", [])
+                if _aircon_state(item) not in {"unknown", "unavailable"}
+            ] if isinstance(aircon.get("expected_states"), list) else [],
+            "control_type": str(aircon.get("control_type") or "mode_command"),
+            "state_authority": "ha_entity",
+            "verification_mode": "ha_state",
+            "state_tracking": "tracked",
+            "proof_ceiling": str(aircon.get("proof_ceiling") or AIRCON_STATUS_PROOF_CEILING),
+        },
+    }
+
+
+def _tracked_aircon_action_ids(actions: list[dict[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for action in actions:
+        if str(action.get("appliance_id") or "") != "aircon":
+            continue
+        if str(action.get("state_tracking") or "") != "tracked":
+            continue
+        if str(action.get("verification_mode") or "") != "ha_state":
+            continue
+        action_id = str(action.get("action_id") or "").strip()
+        if action_id:
+            ids.append(action_id)
+    return ids
+
+
+def _aircon_state(value: object) -> str:
+    state = str(value or "").strip().lower()
+    aliases = {
+        "オフ": "off",
+        "冷房": "cool",
+        "暖房": "heat",
+        "送風": "fan_only",
+        "除湿": "dry",
+        "unavailable": "unavailable",
+        "unknown": "unknown",
+    }
+    state = aliases.get(state, state)
+    allowed = {"off", "cool", "heat", "dry", "fan_only", "auto", "heat_cool", "unknown", "unavailable"}
+    return state if state in allowed else "unknown"
+
+
+def _aircon_status_label(state: str) -> str:
+    return {
+        "off": "off",
+        "cool": "cooling_mode",
+        "heat": "heating_mode",
+        "dry": "dry_mode",
+        "fan_only": "fan_only_mode",
+        "auto": "auto_mode",
+        "heat_cool": "heat_cool_mode",
+        "unavailable": "unavailable",
+        "unknown": "unknown",
+    }.get(state, "unknown")
+
+
+def _aircon_status_match_class(
+    *,
+    action_id: str,
+    state: str,
+    checkstate_status: str,
+) -> str:
+    if checkstate_status == "mismatch":
+        return "mismatch"
+    if checkstate_status != "matched":
+        return "unknown"
+    if action_id == "aircon_restore_original":
+        return "restore_original_matched"
+    if state == "off":
+        return "off_matched"
+    if state == "cool":
+        return "cool_matched"
+    return "unknown"
+
+
+def _aircon_freshness_class(
+    freshness: dict[str, Any],
+    *,
+    available: bool,
+    stale: bool,
+) -> str:
+    if available:
+        return "fresh"
+    if stale and freshness:
+        return "stale"
+    return "unavailable"
+
+
+def _aircon_safe_wording_class(
+    *,
+    available: bool,
+    stale: bool,
+    state: str,
+    checkstate_status: str,
+) -> str:
+    if available:
+        return "HA_visible_aircon_status_class_available"
+    if stale and state not in {"unknown", "unavailable"}:
+        return "last_known_aircon_status_only_must_revalidate"
+    return "current_ac_status_unavailable_must_revalidate_current_state"
+
+
+def _aircon_status_answer_hint(
+    *,
+    available: bool,
+    stale: bool,
+    state: str,
+) -> str:
+    if stale and state not in {"unknown", "unavailable"}:
+        return "最後に分かっている範囲ではエアコン状態を読めるが、現在状態としては古いため再取得が必要です。"
+    if not available:
+        return "現在のEnvironment Stateではエアコンの現在状態を確認できない。再取得が必要です。"
+    if state == "off":
+        return "Home Control/HAの読み取り専用状態では、エアコンはオフ扱いです。"
+    if state == "cool":
+        return "Home Control/HAの読み取り専用状態では、エアコンは冷房扱いです。"
+    if state == "heat":
+        return "Home Control/HAの読み取り専用状態では、エアコンは暖房扱いです。"
+    return "Home Control/HAの読み取り専用状態でエアコン状態を要約しています。"
 
 
 def _room_light_state_query(room_light: object) -> dict[str, Any]:

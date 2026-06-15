@@ -214,6 +214,8 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             self.assertIn("snapshot_id", body)
             self.assertIn("environment", body)
             self.assertIn("actions", body["environment"])
+            self.assertIn("action_readiness", body["environment"])
+            self.assertNotIn("expected_effect", body["environment"]["actions"][0])
             self.assertNotIn("relations", body["environment"])
             self.assertNotIn("last_home_assistant_events", body["environment"])
         finally:

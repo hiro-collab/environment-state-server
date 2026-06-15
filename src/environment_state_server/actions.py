@@ -18,6 +18,12 @@ class ActionDefinition:
     risk_level: str
     expected_state: str
     expected_effect: dict[str, Any]
+    live_test_candidate: bool = False
+    restore_action_id: str | None = None
+    stop_action_id: str | None = None
+    terminal_action: bool = False
+    safety_requirements: tuple[str, ...] = ()
+    proof_ceiling: str | None = None
 
 
 def _command_only_effect(expected_state: str, *, control_type: str) -> dict[str, Any]:
@@ -44,6 +50,27 @@ def _open_loop_effect(expected_state: str) -> dict[str, Any]:
     }
 
 
+def _ha_state_effect(
+    expected_state: str,
+    *,
+    control_type: str,
+    domain: str,
+    service: str,
+    entity_id: str,
+) -> dict[str, Any]:
+    return {
+        "expected_state": expected_state,
+        "control_type": control_type,
+        "state_authority": "ha_entity",
+        "verification_mode": "ha_state",
+        "evidence_class": "ha_state",
+        "physical_state_source": "home_assistant",
+        "domain": domain,
+        "service": service,
+        "entity_id": entity_id,
+    }
+
+
 ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
     ActionDefinition(
         action_id="door_open",
@@ -66,7 +93,18 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="door_motion",
         risk_level="medium",
         expected_state="open",
-        expected_effect=_command_only_effect("open", control_type="position_command"),
+        expected_effect=_ha_state_effect(
+            "open",
+            control_type="position_command",
+            domain="cover",
+            service="open_cover",
+            entity_id="cover.demo_curtain",
+        ),
+        live_test_candidate=True,
+        restore_action_id="door_close",
+        stop_action_id="door_stop",
+        safety_requirements=("obstruction_clearance", "original_position_restore"),
+        proof_ceiling="ha_visible_cover_position_checkstate_layer",
     ),
     ActionDefinition(
         action_id="door_close",
@@ -91,7 +129,18 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="door_motion",
         risk_level="medium",
         expected_state="closed",
-        expected_effect=_command_only_effect("closed", control_type="position_command"),
+        expected_effect=_ha_state_effect(
+            "closed",
+            control_type="position_command",
+            domain="cover",
+            service="close_cover",
+            entity_id="cover.demo_curtain",
+        ),
+        live_test_candidate=True,
+        restore_action_id="door_open",
+        stop_action_id="door_stop",
+        safety_requirements=("obstruction_clearance", "original_position_restore"),
+        proof_ceiling="ha_visible_cover_position_checkstate_layer",
     ),
     ActionDefinition(
         action_id="door_stop",
@@ -113,6 +162,7 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         risk_level="medium",
         expected_state="stopped",
         expected_effect=_command_only_effect("stopped", control_type="position_command"),
+        proof_ceiling="command_ack_only",
     ),
     ActionDefinition(
         action_id="light_on",
@@ -228,8 +278,6 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
             "エアコン切って",
             "エアコンを止めて",
             "エアコン止めて",
-            "エアコンを停止して",
-            "エアコン停止して",
             "冷房を消して",
             "冷房を止めて",
             "暖房を消して",
@@ -245,6 +293,54 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         risk_level="medium",
         expected_state="off",
         expected_effect=_command_only_effect("off", control_type="stateless_command"),
+    ),
+    ActionDefinition(
+        action_id="aircon_cool",
+        label="エアコンを冷房にする",
+        appliance_id="aircon",
+        aliases=(
+            "エアコンを冷房にして",
+            "エアコン冷房にして",
+            "冷房にして",
+            "冷房をつけて",
+        ),
+        target_label="エアコン",
+        verb="冷房にする",
+        pre_action_phrase="エアコンを冷房にする",
+        requires_confirmation=True,
+        confirmation_reason="climate_control",
+        risk_level="medium",
+        expected_state="cool",
+        expected_effect=_ha_state_effect(
+            "cool",
+            control_type="mode_command",
+            domain="climate",
+            service="set_hvac_mode",
+            entity_id="climate.demo_aircon",
+        ),
+    ),
+    ActionDefinition(
+        action_id="aircon_hvac_off",
+        label="エアコンを停止する",
+        appliance_id="aircon",
+        aliases=(
+            "エアコンを停止して",
+            "エアコン停止して",
+        ),
+        target_label="エアコン",
+        verb="停止する",
+        pre_action_phrase="エアコンを停止する",
+        requires_confirmation=True,
+        confirmation_reason="climate_control",
+        risk_level="medium",
+        expected_state="off",
+        expected_effect=_ha_state_effect(
+            "off",
+            control_type="mode_command",
+            domain="climate",
+            service="set_hvac_mode",
+            entity_id="climate.demo_aircon",
+        ),
     ),
     ActionDefinition(
         action_id="vacuum_start",
@@ -265,7 +361,17 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="vacuum_motion",
         risk_level="medium",
         expected_state="cleaning",
-        expected_effect=_command_only_effect("cleaning", control_type="job_command"),
+        expected_effect=_ha_state_effect(
+            "cleaning",
+            control_type="job_command",
+            domain="vacuum",
+            service="start",
+            entity_id="vacuum.demo_cloud_target",
+        ),
+        live_test_candidate=True,
+        restore_action_id="vacuum_return",
+        safety_requirements=("path_floor_safety",),
+        proof_ceiling="ha_visible_vacuum_state_checkstate_layer",
     ),
     ActionDefinition(
         action_id="vacuum_return",
@@ -286,7 +392,16 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="vacuum_motion",
         risk_level="medium",
         expected_state="returning",
-        expected_effect=_command_only_effect("returning", control_type="job_command"),
+        expected_effect=_ha_state_effect(
+            "docked",
+            control_type="job_command",
+            domain="vacuum",
+            service="return_to_base",
+            entity_id="vacuum.demo_cloud_target",
+        ),
+        live_test_candidate=True,
+        terminal_action=True,
+        proof_ceiling="ha_visible_vacuum_return_checkstate_layer",
     ),
     ActionDefinition(
         action_id="vacuum_pause",
@@ -307,7 +422,36 @@ ACTION_DEFINITIONS: tuple[ActionDefinition, ...] = (
         confirmation_reason="vacuum_motion",
         risk_level="medium",
         expected_state="paused",
-        expected_effect=_command_only_effect("paused", control_type="job_command"),
+        expected_effect=_ha_state_effect(
+            "paused",
+            control_type="job_command",
+            domain="vacuum",
+            service="pause",
+            entity_id="vacuum.demo_cloud_target",
+        ),
+        live_test_candidate=True,
+        restore_action_id="vacuum_return",
+        safety_requirements=("active_task_context", "return_cleanup"),
+        proof_ceiling="ha_visible_vacuum_state_checkstate_layer",
+    ),
+    ActionDefinition(
+        action_id="projection_mode",
+        label="プロジェクションモードにする",
+        appliance_id="projection",
+        aliases=(
+            "プロジェクションモードにして",
+            "プロジェクションにして",
+            "投影モードにして",
+        ),
+        target_label="プロジェクション",
+        verb="切り替える",
+        pre_action_phrase="プロジェクションモードにする",
+        requires_confirmation=True,
+        confirmation_reason="display_mode",
+        risk_level="medium",
+        expected_state="projection_mode",
+        expected_effect=_command_only_effect("projection_mode", control_type="stateless_command"),
+        proof_ceiling="not_home_control_appliance_coverage_row",
     ),
 )
 
@@ -322,6 +466,17 @@ def _action_payload(
 ) -> dict[str, Any]:
     current_state = _current_state(appliance)
     available, noop, reason = _availability(action, current_state)
+    live_test_blockers = _live_test_blockers(action)
+    live_test_readiness = (
+        "test_now"
+        if action.live_test_candidate and not live_test_blockers
+        else "do_not_test_current_config"
+        if action.live_test_candidate
+        else "not_live_test_candidate"
+    )
+    proof_ceiling = _action_proof_ceiling(action)
+    verification_mode = _verification_mode(action.expected_effect)
+    state_tracking = _state_tracking(action.expected_effect)
     return {
         "action_id": action.action_id,
         "label": action.label,
@@ -341,6 +496,18 @@ def _action_payload(
         "current_state": current_state,
         "expected_state": action.expected_state,
         "expected_effect": dict(action.expected_effect),
+        "control_type": action.expected_effect.get("control_type"),
+        "state_authority": action.expected_effect.get("state_authority"),
+        "verification_mode": verification_mode,
+        "state_tracking": state_tracking,
+        "proof_ceiling": proof_ceiling,
+        "live_test_candidate": action.live_test_candidate,
+        "live_test_readiness": live_test_readiness,
+        "live_test_blockers": live_test_blockers,
+        "restore_action_id": action.restore_action_id,
+        "stop_action_id": action.stop_action_id,
+        "terminal_action": action.terminal_action,
+        "safety_requirements": list(action.safety_requirements),
         "recheck_visibility": _recheck_visibility(action),
         "available": available,
         "noop": noop,
@@ -351,6 +518,25 @@ def _action_payload(
 
 def _recheck_visibility(action: ActionDefinition) -> dict[str, Any]:
     effect = action.expected_effect
+    proof_ceiling = _action_proof_ceiling(action)
+    live_test_blockers = _live_test_blockers(action)
+    live_test_readiness = (
+        "test_now"
+        if action.live_test_candidate and not live_test_blockers
+        else "do_not_test_current_config"
+        if action.live_test_candidate
+        else "not_live_test_candidate"
+    )
+    live_fields = {
+        "proof_ceiling": proof_ceiling,
+        "live_test_candidate": action.live_test_candidate,
+        "live_test_readiness": live_test_readiness,
+        "live_test_blockers": live_test_blockers,
+        "restore_action_id": action.restore_action_id,
+        "stop_action_id": action.stop_action_id,
+        "terminal_action": action.terminal_action,
+        "safety_requirements": list(action.safety_requirements),
+    }
     physical_state_source = str(effect.get("physical_state_source") or "").strip()
     evidence_class = str(effect.get("evidence_class") or "").strip()
     entity_id = str(effect.get("entity_id") or "").strip()
@@ -358,6 +544,7 @@ def _recheck_visibility(action: ActionDefinition) -> dict[str, Any]:
 
     if physical_state_source == "not_supported":
         return {
+            **live_fields,
             "status": "known_gap",
             "structured_signal": "action_registry.expected_effect",
             "evidence_class": evidence_class or "action_event_only",
@@ -368,6 +555,7 @@ def _recheck_visibility(action: ActionDefinition) -> dict[str, Any]:
 
     if entity_id:
         return {
+            **live_fields,
             "status": "observable",
             "structured_signal": "home_assistant.entity_state",
             "evidence_class": evidence_class or "physical_state_supported",
@@ -377,11 +565,142 @@ def _recheck_visibility(action: ActionDefinition) -> dict[str, Any]:
         }
 
     return {
+        **live_fields,
         "status": "unmapped",
         "structured_signal": "action_registry.expected_state",
         "evidence_class": evidence_class or "expected_state_only",
         "physical_state_source": physical_state_source or "not_declared",
     }
+
+
+def _verification_mode(effect: dict[str, Any]) -> str:
+    value = str(effect.get("verification_mode") or "").strip()
+    if value:
+        return value
+    return "ha_state" if effect.get("entity_id") else "command_ack_only"
+
+
+def _state_tracking(effect: dict[str, Any]) -> str:
+    verification_mode = _verification_mode(effect)
+    state_authority = str(effect.get("state_authority") or "").strip()
+    if verification_mode == "ha_state" and state_authority in {"ha_entity", "ha_inferred"}:
+        return "tracked"
+    if verification_mode == "external_observation" or state_authority == "open_loop":
+        return "external_required"
+    if verification_mode == "manual_confirmation" or state_authority == "manual":
+        return "manual_required"
+    if verification_mode == "unsupported":
+        return "unsupported"
+    return "ack_only"
+
+
+def _action_proof_ceiling(action: ActionDefinition) -> str:
+    if action.proof_ceiling:
+        return action.proof_ceiling
+    effect = action.expected_effect
+    if _state_tracking(effect) == "tracked":
+        return "ha_visible_state_checkstate_layer"
+    if _verification_mode(effect) == "external_observation":
+        return "external_observation_required"
+    return "command_ack_only"
+
+
+def _live_test_blockers(action: ActionDefinition) -> list[str]:
+    blockers: list[str] = []
+    if not action.live_test_candidate:
+        return ["not_marked_live_test_candidate"]
+    if _state_tracking(action.expected_effect) != "tracked":
+        blockers.append("missing_ha_visible_success_criterion")
+    if not action.terminal_action and not action.restore_action_id and not action.stop_action_id:
+        blockers.append("missing_restore_or_stop")
+    for requirement in action.safety_requirements:
+        blockers.append(f"safety_requirement:{requirement}")
+    return blockers
+
+
+def action_readiness_summary(actions: list[dict[str, Any]]) -> dict[str, Any]:
+    by_readiness: dict[str, int] = {}
+    proof_ceilings: dict[str, int] = {}
+    candidate_ids: list[str] = []
+    blocked_candidate_ids: list[str] = []
+    for action in actions:
+        readiness = str(action.get("live_test_readiness") or "unknown")
+        proof_ceiling = str(action.get("proof_ceiling") or "unknown")
+        by_readiness[readiness] = by_readiness.get(readiness, 0) + 1
+        proof_ceilings[proof_ceiling] = proof_ceilings.get(proof_ceiling, 0) + 1
+        action_id = str(action.get("action_id") or "")
+        if action.get("live_test_candidate") is True and action_id:
+            candidate_ids.append(action_id)
+            if readiness != "test_now":
+                blocked_candidate_ids.append(action_id)
+    return {
+        "schema_version": "home_control_action_readiness.v0",
+        "by_readiness": by_readiness,
+        "proof_ceilings": proof_ceilings,
+        "live_test_candidate_ids": candidate_ids,
+        "blocked_live_test_candidate_ids": blocked_candidate_ids,
+        "test_now_count": by_readiness.get("test_now", 0),
+        "blocked_candidate_count": len(blocked_candidate_ids),
+    }
+
+
+def public_action_summaries(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    allowed_fields = (
+        "action_id",
+        "label",
+        "appliance_id",
+        "target_label",
+        "verb",
+        "pre_action_phrase",
+        "requires_confirmation",
+        "confirmation_reason",
+        "risk_level",
+        "current_state",
+        "expected_state",
+        "control_type",
+        "state_authority",
+        "verification_mode",
+        "state_tracking",
+        "proof_ceiling",
+        "live_test_candidate",
+        "live_test_readiness",
+        "live_test_blockers",
+        "restore_action_id",
+        "stop_action_id",
+        "terminal_action",
+        "safety_requirements",
+        "available",
+        "noop",
+        "reason",
+        "reason_text",
+    )
+    summaries: list[dict[str, Any]] = []
+    for action in actions:
+        summary = {field: action[field] for field in allowed_fields if field in action}
+        recheck = action.get("recheck_visibility")
+        if isinstance(recheck, dict):
+            summary["recheck_visibility"] = {
+                field: recheck[field]
+                for field in (
+                    "status",
+                    "structured_signal",
+                    "evidence_class",
+                    "physical_state_source",
+                    "unverified_state_label",
+                    "review_note",
+                    "proof_ceiling",
+                    "live_test_candidate",
+                    "live_test_readiness",
+                    "live_test_blockers",
+                    "restore_action_id",
+                    "stop_action_id",
+                    "terminal_action",
+                    "safety_requirements",
+                )
+                if field in recheck
+            }
+        summaries.append(summary)
+    return summaries
 
 
 def _current_state(appliance: dict[str, Any] | None) -> dict[str, Any] | None:

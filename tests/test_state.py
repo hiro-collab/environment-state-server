@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import UTC, datetime, timedelta
 
@@ -63,6 +64,7 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertIn("電気を消して", light_off["aliases"])
         self.assertIn("capabilities", current)
         self.assertTrue(current["capabilities"]["actions"])
+        self.assertIn("action_readiness", current)
 
     def test_action_without_expected_effect_does_not_create_appliance_state(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
@@ -187,6 +189,88 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertEqual(vacuum_start["risk_level"], "medium")
         self.assertTrue(vacuum_start["confirmation_policy"]["requires_confirmation"])
         self.assertEqual(vacuum_start["confirmation_policy"]["reason"], "vacuum_motion")
+        self.assertEqual(vacuum_start["state_tracking"], "tracked")
+        self.assertEqual(
+            vacuum_start["proof_ceiling"],
+            "ha_visible_vacuum_state_checkstate_layer",
+        )
+        self.assertEqual(
+            vacuum_start["live_test_readiness"],
+            "do_not_test_current_config",
+        )
+        self.assertIn(
+            "safety_requirement:path_floor_safety",
+            vacuum_start["live_test_blockers"],
+        )
+
+    def test_action_readiness_summarizes_ha_visible_authority(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+
+        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
+        actions = {action["action_id"]: action for action in current["actions"]}
+
+        door_open = actions["door_open"]
+        self.assertEqual(door_open["state_tracking"], "tracked")
+        self.assertEqual(
+            door_open["proof_ceiling"],
+            "ha_visible_cover_position_checkstate_layer",
+        )
+        self.assertEqual(door_open["restore_action_id"], "door_close")
+        self.assertEqual(door_open["stop_action_id"], "door_stop")
+        self.assertEqual(
+            door_open["live_test_readiness"],
+            "do_not_test_current_config",
+        )
+        self.assertIn(
+            "safety_requirement:obstruction_clearance",
+            door_open["live_test_blockers"],
+        )
+
+        vacuum_return = actions["vacuum_return"]
+        self.assertEqual(vacuum_return["state_tracking"], "tracked")
+        self.assertTrue(vacuum_return["terminal_action"])
+        self.assertEqual(vacuum_return["live_test_readiness"], "test_now")
+        self.assertEqual(
+            vacuum_return["proof_ceiling"],
+            "ha_visible_vacuum_return_checkstate_layer",
+        )
+
+        projection_mode = actions["projection_mode"]
+        self.assertFalse(projection_mode["live_test_candidate"])
+        self.assertEqual(
+            projection_mode["proof_ceiling"],
+            "not_home_control_appliance_coverage_row",
+        )
+
+        summary = current["action_readiness"]
+        self.assertEqual(summary["schema_version"], "home_control_action_readiness.v0")
+        self.assertEqual(summary["test_now_count"], 1)
+        self.assertEqual(summary["blocked_candidate_count"], 4)
+        self.assertIn("vacuum_return", summary["live_test_candidate_ids"])
+        self.assertIn("door_open", summary["blocked_live_test_candidate_ids"])
+
+        indicators = store.indicators_current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
+        public_door = next(
+            action
+            for action in indicators["environment"]["actions"]
+            if action["action_id"] == "door_open"
+        )
+        self.assertEqual(public_door["state_tracking"], "tracked")
+        self.assertNotIn("expected_effect", public_door)
+        self.assertNotIn("entity_id", public_door.get("recheck_visibility", {}))
+        self.assertEqual(
+            indicators["environment"]["action_readiness"]["test_now_count"],
+            1,
+        )
+        for public_action in indicators["environment"]["actions"]:
+            self.assertNotIn("expected_effect", public_action)
+            self.assertNotIn("entity_id", public_action)
+            self.assertNotIn("domain", public_action)
+            self.assertNotIn("service", public_action)
+            recheck = public_action.get("recheck_visibility", {})
+            self.assertNotIn("entity_id", recheck)
+            self.assertNotIn("domain", recheck)
+            self.assertNotIn("service", recheck)
 
     def test_aircon_actions_expose_unverified_recheck_visibility(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
@@ -211,6 +295,150 @@ class EnvironmentStateStoreTest(unittest.TestCase):
             aircon_off["recheck_visibility"]["unverified_state_label"],
             "submitted_unverified",
         )
+
+    def test_aircon_current_status_query_registers_readonly_checkstate(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        store.ingest_home_control_action_state(
+            {
+                "action_id": "aircon_hvac_off",
+                "status": "matched",
+                "control_type": "mode_command",
+                "state_authority": "ha_entity",
+                "verification_mode": "ha_state",
+                "state_tracking": "tracked",
+                "expected_state": "off",
+                "expected_states": ["off"],
+                "actual_state": "off",
+                "observed_at": "2026-06-15T10:00:00+00:00",
+            }
+        )
+
+        current = store.current(now=datetime(2026, 6, 15, 10, 0, 1, tzinfo=UTC))
+        query = current["state_queries"]["aircon_current_status"]
+
+        self.assertTrue(query["available"])
+        self.assertFalse(query["stale"])
+        self.assertEqual(query["state"], "off")
+        self.assertEqual(query["current_status"], "off")
+        self.assertFalse(query["state_is_last_known"])
+        self.assertEqual(query["status_label"], "off")
+        self.assertEqual(query["appliance_family"], "aircon")
+        self.assertEqual(query["status_availability_class"], "available_fresh")
+        self.assertEqual(query["status_match_class"], "off_matched")
+        self.assertEqual(query["freshness_class"], "fresh")
+        self.assertEqual(
+            query["safe_wording_class"],
+            "HA_visible_aircon_status_class_available",
+        )
+        self.assertEqual(query["source_class"], "Home_Control_HA_visible_tracked_climate")
+        self.assertEqual(
+            query["proof_ceiling"],
+            "HA_visible_climate_state_only",
+        )
+        self.assertEqual(query["freshness"]["level"], "fresh")
+        self.assertEqual(query["evidence"]["source"], "home_control_readonly")
+        self.assertEqual(query["evidence"]["checkstate_status"], "matched")
+        self.assertEqual(query["evidence"]["tracked_action_ids"], ["aircon_cool", "aircon_hvac_off"])
+        self.assertIn("physical_hvac_comfort", query["does_not_prove"])
+        self.assertNotIn("entity_id", json.dumps(query, ensure_ascii=False))
+
+        actions = {action["action_id"]: action for action in current["actions"]}
+        self.assertFalse(actions["aircon_hvac_off"]["available"])
+        self.assertTrue(actions["aircon_hvac_off"]["noop"])
+        self.assertEqual(actions["aircon_hvac_off"]["reason"], "already_off")
+
+        indicators = store.indicators_current(now=datetime(2026, 6, 15, 10, 0, 1, tzinfo=UTC))
+        public_query = indicators["environment"]["state_queries"]["aircon_current_status"]
+        self.assertEqual(public_query["state"], "off")
+        self.assertNotIn("entity_id", json.dumps(public_query, ensure_ascii=False))
+
+    def test_aircon_current_status_query_marks_readonly_checkstate_stale_as_last_known(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=1000)
+        store.ingest_home_control_action_state(
+            {
+                "action_id": "aircon_cool",
+                "status": "matched",
+                "control_type": "mode_command",
+                "state_authority": "ha_entity",
+                "verification_mode": "ha_state",
+                "state_tracking": "tracked",
+                "expected_state": "cool",
+                "expected_states": ["cool"],
+                "actual_state": "cool",
+                "observed_at": "2026-06-15T10:00:00+00:00",
+            }
+        )
+
+        current = store.current(now=datetime(2026, 6, 15, 10, 0, 2, tzinfo=UTC))
+        query = current["state_queries"]["aircon_current_status"]
+
+        self.assertFalse(query["available"])
+        self.assertTrue(query["stale"])
+        self.assertEqual(query["state"], "cool")
+        self.assertTrue(query["state_is_last_known"])
+        self.assertEqual(query["status_availability_class"], "available_stale")
+        self.assertEqual(query["status_match_class"], "cool_matched")
+        self.assertEqual(query["freshness_class"], "stale")
+        self.assertEqual(
+            query["safe_wording_class"],
+            "last_known_aircon_status_only_must_revalidate",
+        )
+        self.assertEqual(query["stale_reason"], "aircon_current_status_stale")
+        self.assertEqual(query["freshness"]["level"], "stale")
+        self.assertIn("最後に分かっている範囲", query["answer_hint"])
+
+    def test_aircon_current_status_query_keeps_readable_mismatch_as_current_status(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        store.ingest_home_control_action_state(
+            {
+                "action_id": "aircon_cool",
+                "status": "mismatch",
+                "control_type": "mode_command",
+                "state_authority": "ha_entity",
+                "verification_mode": "ha_state",
+                "state_tracking": "tracked",
+                "expected_state": "cool",
+                "expected_states": ["cool"],
+                "actual_state": "off",
+                "observed_at": "2026-06-15T10:00:00+00:00",
+            }
+        )
+
+        current = store.current(now=datetime(2026, 6, 15, 10, 0, 1, tzinfo=UTC))
+        query = current["state_queries"]["aircon_current_status"]
+
+        self.assertTrue(query["available"])
+        self.assertFalse(query["stale"])
+        self.assertEqual(query["state"], "off")
+        self.assertEqual(query["status_availability_class"], "available_fresh")
+        self.assertEqual(query["status_match_class"], "mismatch")
+        self.assertEqual(query["safe_wording_class"], "HA_visible_aircon_status_class_available")
+
+    def test_aircon_current_status_query_rejects_untracked_status_source(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        store.ingest_home_control_action_state(
+            {
+                "action_id": "aircon_off",
+                "status": "ack_only",
+                "state_authority": "submitted_only",
+                "verification_mode": "command_ack_only",
+                "state_tracking": "ack_only",
+                "actual_state": "off",
+                "observed_at": "2026-06-15T10:00:00+00:00",
+            }
+        )
+
+        current = store.current(now=datetime(2026, 6, 15, 10, 0, 1, tzinfo=UTC))
+        query = current["state_queries"]["aircon_current_status"]
+
+        self.assertNotIn("aircon", current["appliances"])
+        self.assertFalse(query["available"])
+        self.assertTrue(query["stale"])
+        self.assertEqual(query["state"], "unknown")
+        self.assertEqual(query["status_availability_class"], "unavailable")
+        self.assertEqual(query["status_match_class"], "unknown")
+        self.assertEqual(query["freshness_class"], "unavailable")
+        self.assertEqual(query["stale_reason"], "aircon_current_status_missing")
 
     def test_ttl_marks_state_stale(self) -> None:
         store = EnvironmentStateStore(ttl_ms=1000)

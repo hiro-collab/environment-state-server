@@ -11,6 +11,7 @@ from pathlib import Path
 from .camera_hub import CameraHubSubscriber
 from .feedback import StateQueryFeedbackStore
 from .ha_events import HomeAssistantEventTailer
+from .home_control_status import HomeControlActionStatePoller, HomeControlActionStateProbe
 from .http_api import EnvironmentHttpServer
 from .module_polling import ModuleProbe, ModuleStatusPoller
 from .state import EnvironmentStateStore
@@ -67,10 +68,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--module-poll-interval-seconds", type=float, default=2.0)
     parser.add_argument("--home-assistant-health-url", default="http://127.0.0.1:8787/health")
+    parser.add_argument("--home-control-bridge-url", default="http://127.0.0.1:8787")
+    parser.add_argument("--home-control-api-token-env", default="HOME_CONTROL_API_TOKEN")
+    parser.add_argument(
+        "--aircon-status-action-id",
+        action="append",
+        default=[],
+        help="Tracked climate action_id to poll through Home Control /actions/{id}/state.",
+    )
     parser.add_argument("--aituber-url", default="http://127.0.0.1:3000")
     parser.add_argument("--dify-url", default="http://127.0.0.1:8080")
     parser.add_argument("--voicevox-health-url", default="http://127.0.0.1:50021/version")
     parser.add_argument("--disable-ha-events", action="store_true")
+    parser.add_argument("--disable-home-control-status", action="store_true")
     parser.add_argument("--disable-camera-hub", action="store_true")
     parser.add_argument("--disable-module-polling", action="store_true")
     return parser
@@ -108,6 +118,29 @@ def run(args: argparse.Namespace) -> None:
         camera_subscriber.start()
         workers.append(camera_subscriber)
         print(f"camera hub: {args.camera_hub_url}", flush=True)
+
+    if not args.disable_home_control_status:
+        home_control_token = os.environ.get(args.home_control_api_token_env, "").strip()
+        if home_control_token:
+            action_ids = tuple(
+                args.aircon_status_action_id
+                or ["aircon_hvac_off", "aircon_cool", "aircon_restore_original"]
+            )
+            home_control_poller = HomeControlActionStatePoller(
+                HomeControlActionStateProbe(
+                    action_ids=action_ids,
+                    base_url=args.home_control_bridge_url,
+                    api_token=home_control_token,
+                    timeout_seconds=1.2,
+                ),
+                store.ingest_home_control_action_state,
+                interval_seconds=args.module_poll_interval_seconds,
+            )
+            home_control_poller.start()
+            workers.append(home_control_poller)
+            print(f"home control read-only status: {len(action_ids)} probes", flush=True)
+        else:
+            print("home control read-only status: skipped (token missing)", flush=True)
 
     for index, url in enumerate(args.vision_topic_url or [], start=1):
         source = "vision_snapshot_processor" if index == 1 else f"vision_topic_{index}"

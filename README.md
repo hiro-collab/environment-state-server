@@ -50,6 +50,7 @@ uv run --env-file $HomeControlEnv python -m environment_state_server.main `
   --camera-hub-url ws://127.0.0.1:8765 `
   --vision-topic-url ws://127.0.0.1:8776 `
   --home-assistant-health-url http://127.0.0.1:8787/health `
+  --home-control-bridge-url http://127.0.0.1:8787 `
   --aituber-url http://127.0.0.1:3000 `
   --dify-url http://127.0.0.1:8080 `
   --voicevox-health-url http://127.0.0.1:50021/version
@@ -78,6 +79,18 @@ Auth token は `ENVIRONMENT_API_TOKEN` または `HOME_CONTROL_API_TOKEN` を使
 - Camera Hub topic と追加 vision topic は TTL を持つ snapshot として扱います。
 - stale な camera / gesture / module は reason を付けます。
 - `state_queries.room_light` は Dify が状態照会に使う projection です。画像判定の authority は `vision_snapshot_processor`、projection の担当は `environment_state_server` です。
+- `state_queries.aircon_current_status` は Home Control の読み取り専用 tracked climate state だけを
+  Environment State 向けに安全化した projection です。`actual_state` 由来の要約、freshness、
+  `status_availability_class`、`status_match_class`、`safe_wording_class`、`proof_ceiling` を返します。
+  proof ceiling は `HA_visible_climate_state_only` であり、物理的な冷暖房・快適性・送風・Home Control
+  action success の proof ではありません。古い場合は `last_known_aircon_status_only_must_revalidate`、
+  読めない場合は `current_ac_status_unavailable_must_revalidate_current_state` として扱います。
+- `actions[]` には Home Control action の `state_tracking`、`proof_ceiling`、`live_test_readiness`、
+  `restore_action_id`、`stop_action_id`、`safety_requirements` が入ります。`test_now` は
+  HA-visible success criterion と restore/stop/terminal 条件が揃う source/readiness 表示であり、
+  実行済みや物理 proof ではありません。
+- `action_readiness` は `actions[]` の要約です。Launcher、Projection Visual、diagnostics は
+  これを使って Home Assistant state で確認できる行と、設定/安全/観察が足りない行を分けます。
 - `state_queries.room_light.learning` には `/feedback/state-query/summary` と同じ学習レベルの要約が入ります。これは user_feedback の蓄積状況であり、画像判定そのものを上書きする authority ではありません。
 - `state_queries.room_light` は `observed_at`、`updated_at`、`source_snapshot_id`、`stale_reason` を含みます。操作後確認では古い snapshot を post-action evidence として扱わないでください。
 - `wait_for=room_light` の `wait_result.matched=true` は、`state_queries.room_light.observed_at` が `after` より新しく、`source_snapshot_id` が存在する場合だけです。HTTP 200 のまま `wait_result.matched=false` / `reason=timeout` を返すことがあります。
@@ -87,7 +100,8 @@ Auth token は `ENVIRONMENT_API_TOKEN` または `HOME_CONTROL_API_TOKEN` を使
 - `/feedback/state-query/summary` は `label_counts`、`status_counts`、`reason_counts`、`source_context_counts`、`action_counts`、`expected_state_counts`、`learning` を返します。`status_counts` は `accepted`、`accepted_with_warning`、`duplicate`、`rejected` の固定キーです。`duplicate` と `rejected` は実行中プロセスの診断カウントです。
 - `learning.level` は `none`、`collecting`、`seeded`、`usable`、`reinforced` の5段階です。`learning.problems[]` には `code`、`severity`、`message` が入り、feedbackが少ない、on/offの片側がない、操作後確認がない、rejectがある、といった「学習できていない理由」を機械判定できます。
 - `/environment/relations` は関連メタデータであり、Dify ID や Home Assistant ID の authority ではありません。
-- display 用 endpoint は Dify relation や raw Home Assistant event history を省きます。
+- display 用 endpoint は Dify relation、raw Home Assistant event history、raw entity ID を省きます。
+  公開寄りの `actions[]` は proof/readiness だけの summary です。
 
 ## Action Registry
 
