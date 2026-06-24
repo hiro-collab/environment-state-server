@@ -40,8 +40,9 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             self.assertIn("snapshot_id", body)
             self.assertIn("sequence", body)
             self.assertIn("age_ms", body)
-            self.assertIn("actions", body)
-            self.assertTrue(body["capabilities"]["actions"])
+            self.assertNotIn("actions", body)
+            self.assertNotIn("action_readiness", body)
+            self.assertNotIn("actions", body["capabilities"])
         finally:
             server.shutdown()
             server.server_close()
@@ -107,7 +108,7 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
-    def test_environment_current_projects_room_light_calibration_from_home_assistant(self) -> None:
+    def test_environment_current_does_not_calibrate_room_light_from_command_label(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         observed = datetime.now(UTC)
         store.ingest_home_assistant_event(
@@ -182,16 +183,16 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 self.assertEqual(room_light["state"], "unknown")
                 self.assertEqual(room_light["confidence_label"], "low")
                 self.assertEqual(room_light["learning"]["level"], "reinforced")
-                self.assertEqual(room_light["effective_state"], "on")
-                self.assertEqual(room_light["effective_confidence_label"], "high")
+                self.assertEqual(room_light["effective_state"], "unknown")
+                self.assertEqual(room_light["effective_confidence_label"], "low")
                 self.assertEqual(
                     room_light["effective_authority"],
-                    "environment_state_server.calibration.home_assistant",
+                    "vision_snapshot_processor",
                 )
-                self.assertTrue(room_light["calibration"]["applied"])
+                self.assertFalse(room_light["calibration"]["applied"])
                 self.assertEqual(
                     room_light["calibration"]["reason"],
-                    "fresh_home_assistant_light_state",
+                    "no_supporting_calibration_signal",
                 )
                 self.assertEqual(room_light["calibration"]["raw_state"], "unknown")
             finally:
@@ -213,9 +214,8 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             self.assertEqual(body["schema_version"], 1)
             self.assertIn("snapshot_id", body)
             self.assertIn("environment", body)
-            self.assertIn("actions", body["environment"])
-            self.assertIn("action_readiness", body["environment"])
-            self.assertNotIn("expected_effect", body["environment"]["actions"][0])
+            self.assertNotIn("actions", body["environment"])
+            self.assertNotIn("action_readiness", body["environment"])
             self.assertNotIn("relations", body["environment"])
             self.assertNotIn("last_home_assistant_events", body["environment"])
         finally:

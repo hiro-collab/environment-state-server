@@ -7,9 +7,6 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
-from .actions import action_readiness_summary, build_action_registry, public_action_summaries
-
-
 SCHEMA_VERSION = 1
 HOME_ASSISTANT_SOURCE = "home_assistant"
 HOME_ASSISTANT_EVENTS_SOURCE = "home_assistant_events"
@@ -22,7 +19,6 @@ AIRCON_STATUS_SOURCE_CLASS = "Home_Control_HA_visible_tracked_climate"
 AIRCON_STATUS_AUTHORITY = "home_control_ha_readonly_climate"
 AIRCON_STATUS_PROOF_CEILING = "HA_visible_climate_state_only"
 CAPABILITIES = {
-    "actions": True,
     "relations": True,
     "ready": True,
     "indicators": True,
@@ -235,9 +231,7 @@ class EnvironmentStateStore:
             item["stale"] = True if updated is None else _is_stale(updated, current_time, ttl_seconds)
             item["freshness"] = _freshness(updated, current_time, ttl_seconds)
 
-        actions = build_action_registry(appliances)
-        state_queries = _state_queries_from_environment(vision, appliances, actions)
-        action_readiness = action_readiness_summary(actions)
+        state_queries = _state_queries_from_environment(vision, appliances)
         sources = {
             HOME_ASSISTANT_SOURCE: _node_source_state(
                 nodes.get(HOME_ASSISTANT_BRIDGE_SOURCE),
@@ -283,8 +277,6 @@ class EnvironmentStateStore:
             "freshness": _freshness(observed_at, current_time, ttl_seconds),
             "ttl_ms": self.ttl_ms,
             "appliances": appliances,
-            "actions": actions,
-            "action_readiness": action_readiness,
             "vision": vision,
             "state_queries": state_queries,
             "last_home_assistant_events": events,
@@ -327,8 +319,6 @@ class EnvironmentStateStore:
             "environment": {
                 "ttl_ms": environment.get("ttl_ms"),
                 "appliances": environment.get("appliances", {}),
-                "actions": public_action_summaries(environment.get("actions", [])),
-                "action_readiness": environment.get("action_readiness", {}),
                 "vision": environment.get("vision", {}),
                 "state_queries": environment.get("state_queries", {}),
                 "sources": environment.get("sources", {}),
@@ -356,12 +346,9 @@ class EnvironmentStateStore:
         sources = current.get("sources", {})
         ha_source = sources.get(HOME_ASSISTANT_SOURCE, {})
         camera_hub_source = sources.get(CAMERA_HUB_SOURCE, {})
-        actions = current.get("actions", [])
         reasons: list[str] = []
         if not (bool(ha_source.get("available")) and not bool(ha_source.get("stale"))):
             reasons.append("home_assistant_bridge_unavailable_or_stale")
-        if not actions:
-            reasons.append("action_registry_empty")
         if not (bool(camera_hub_source.get("available")) and not bool(camera_hub_source.get("stale"))):
             reasons.append("camera_hub_stale")
         ready = not reasons
@@ -540,7 +527,7 @@ def _appliance_from_home_assistant_event(
     effect = event.get("expected_effect") if isinstance(event.get("expected_effect"), dict) else None
     if effect is None:
         return None
-    if _effect_requires_external_observation(effect):
+    if not _effect_has_read_state_authority(effect):
         return None
     key = _appliance_key(action_id, effect)
     state = _appliance_state(action_id, effect)
@@ -626,21 +613,12 @@ def _home_control_checkstate_status(value: object) -> str:
     return status if status else "unknown"
 
 
-def _effect_requires_external_observation(effect: dict[str, Any] | None) -> bool:
+def _effect_has_read_state_authority(effect: dict[str, Any] | None) -> bool:
     if not effect:
         return False
-    physical_state_source = str(effect.get("physical_state_source") or "").strip()
     verification_mode = str(effect.get("verification_mode") or "").strip()
     state_authority = str(effect.get("state_authority") or "").strip()
-    evidence_class = str(effect.get("evidence_class") or "").strip()
-    return (
-        physical_state_source == "not_supported"
-        or verification_mode == "external_observation"
-        or verification_mode == "command_ack_only"
-        or state_authority == "open_loop"
-        or state_authority == "submitted_only"
-        or evidence_class in {"action_event_only", "command_ack_only"}
-    )
+    return verification_mode == "ha_state" and state_authority == "ha_entity"
 
 
 def _appliance_key(action_id: str, effect: dict[str, Any] | None) -> str | None:
@@ -705,16 +683,14 @@ def _appliance_state(action_id: str, effect: dict[str, Any] | None) -> str | Non
 def _state_queries_from_environment(
     vision: dict[str, dict[str, Any]],
     appliances: dict[str, dict[str, Any]],
-    actions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
         "room_light": _room_light_state_query(vision.get("room_light")),
-        AIRCON_STATUS_QUERY_ID: _aircon_status_query(appliances.get("aircon"), actions),
+        AIRCON_STATUS_QUERY_ID: _aircon_status_query(appliances.get("aircon")),
     }
 
 
-def _aircon_status_query(aircon: object, actions: list[dict[str, Any]]) -> dict[str, Any]:
-    tracked_action_ids = _tracked_aircon_action_ids(actions)
+def _aircon_status_query(aircon: object) -> dict[str, Any]:
     base = {
         "schema_version": "environment_state_aircon_current_status.v0",
         "authority": AIRCON_STATUS_AUTHORITY,
@@ -759,7 +735,6 @@ def _aircon_status_query(aircon: object, actions: list[dict[str, Any]]) -> dict[
             "evidence": {
                 "reason": "aircon_current_status_missing",
                 "source_class": AIRCON_STATUS_SOURCE_CLASS,
-                "tracked_action_ids": tracked_action_ids,
                 "state_authority": "ha_entity",
                 "verification_mode": "ha_state",
                 "state_tracking": "tracked",
@@ -818,7 +793,6 @@ def _aircon_status_query(aircon: object, actions: list[dict[str, Any]]) -> dict[
         "evidence": {
             "source": str(aircon.get("source") or HOME_CONTROL_READONLY_SOURCE),
             "source_class": str(aircon.get("source_class") or AIRCON_STATUS_SOURCE_CLASS),
-            "tracked_action_ids": tracked_action_ids,
             "checkstate_status": checkstate_status,
             "expected_state": _aircon_state(aircon.get("expected_state")),
             "expected_states": [
@@ -833,21 +807,6 @@ def _aircon_status_query(aircon: object, actions: list[dict[str, Any]]) -> dict[
             "proof_ceiling": str(aircon.get("proof_ceiling") or AIRCON_STATUS_PROOF_CEILING),
         },
     }
-
-
-def _tracked_aircon_action_ids(actions: list[dict[str, Any]]) -> list[str]:
-    ids: list[str] = []
-    for action in actions:
-        if str(action.get("appliance_id") or "") != "aircon":
-            continue
-        if str(action.get("state_tracking") or "") != "tracked":
-            continue
-        if str(action.get("verification_mode") or "") != "ha_state":
-            continue
-        action_id = str(action.get("action_id") or "").strip()
-        if action_id:
-            ids.append(action_id)
-    return ids
 
 
 def _aircon_state(value: object) -> str:
