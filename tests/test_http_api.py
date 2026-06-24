@@ -108,7 +108,7 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
-    def test_environment_current_does_not_calibrate_room_light_from_command_label(self) -> None:
+    def test_environment_current_keeps_room_light_learning_non_authoritative(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         observed = datetime.now(UTC)
         store.ingest_home_assistant_event(
@@ -183,18 +183,11 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 self.assertEqual(room_light["state"], "unknown")
                 self.assertEqual(room_light["confidence_label"], "low")
                 self.assertEqual(room_light["learning"]["level"], "reinforced")
-                self.assertEqual(room_light["effective_state"], "unknown")
-                self.assertEqual(room_light["effective_confidence_label"], "low")
-                self.assertEqual(
-                    room_light["effective_authority"],
-                    "vision_snapshot_processor",
-                )
-                self.assertFalse(room_light["calibration"]["applied"])
-                self.assertEqual(
-                    room_light["calibration"]["reason"],
-                    "no_supporting_calibration_signal",
-                )
-                self.assertEqual(room_light["calibration"]["raw_state"], "unknown")
+                self.assertNotIn("effective_state", room_light)
+                self.assertNotIn("effective_confidence_label", room_light)
+                self.assertNotIn("effective_authority", room_light)
+                self.assertNotIn("effective_answer_hint", room_light)
+                self.assertNotIn("calibration", room_light)
             finally:
                 server.shutdown()
                 server.server_close()
