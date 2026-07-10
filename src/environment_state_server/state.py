@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -14,6 +15,18 @@ HOME_ASSISTANT_BRIDGE_SOURCE = "home_assistant_bridge"
 HOME_CONTROL_READONLY_SOURCE = "home_control_readonly"
 CAMERA_HUB_SOURCE = "camera_hub"
 VISION_SNAPSHOT_PROCESSOR_SOURCE = "vision_snapshot_processor"
+ROOM_LIGHT_TOPIC = "/vision/room_light/observation"
+ROOM_LIGHT_MSG_TYPE = "vision_snapshot_processor/RoomLightObservation"
+ROOM_LIGHT_MODEL_NAME = "room-light-heuristic-snapshot-v3"
+ROOM_LIGHT_MODEL_KIND = "heuristic"
+ROOM_LIGHT_SOURCE_CLASS = "camera_environment_estimate"
+ROOM_LIGHT_PROOF_CEILING = "camera_environment_estimate_only"
+ROOM_LIGHT_DOES_NOT_PROVE = (
+    "physical_room_light_state",
+    "home_assistant_light_state",
+)
+ROOM_LIGHT_IDENTIFIER_MAX_LENGTH = 160
+ROOM_LIGHT_HEADER_SEQUENCE_MAX = 2**63 - 1
 AIRCON_STATUS_QUERY_ID = "aircon_current_status"
 AIRCON_STATUS_SOURCE_CLASS = "Home_Control_HA_visible_tracked_climate"
 AIRCON_STATUS_AUTHORITY = "home_control_ha_readonly_climate"
@@ -163,12 +176,19 @@ class EnvironmentStateStore:
         topic = str(envelope.get("topic") or "")
         header = envelope.get("header") if isinstance(envelope.get("header"), dict) else {}
         payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
-        observed = parse_timestamp(header.get("stamp") if isinstance(header, dict) else None)
-        if isinstance(header, dict) and isinstance(header.get("stamp"), (int, float)):
-            observed = datetime.fromtimestamp(float(header["stamp"]), tz=UTC)
+        if topic == ROOM_LIGHT_TOPIC:
+            room_light = _canonical_room_light_observation(envelope, payload, source=source)
+            if room_light is None:
+                return
+            observed, source_id, value = room_light
+            update = "room_light", value
+        else:
+            observed = parse_timestamp(header.get("stamp") if isinstance(header, dict) else None)
+            if isinstance(header, dict) and isinstance(header.get("stamp"), (int, float)):
+                observed = datetime.fromtimestamp(float(header["stamp"]), tz=UTC)
 
-        source_id = _source_id(source)
-        update = _vision_update_from_topic(topic, payload, header, observed, source=source_id)
+            source_id = _source_id(source)
+            update = _vision_update_from_topic(topic, payload, header, observed, source=source_id)
         if update is None:
             return
         key, value = update
@@ -226,11 +246,11 @@ class EnvironmentStateStore:
             item["stale"] = True if updated is None else _is_stale(updated, current_time, ttl_seconds)
             item["freshness"] = _freshness(updated, current_time, ttl_seconds)
         for item in vision.values():
-            updated = parse_optional_timestamp(item.get("updated_at"))
+            updated = parse_optional_timestamp(item.get("observed_at") or item.get("updated_at"))
             item["stale"] = True if updated is None else _is_stale(updated, current_time, ttl_seconds)
             item["freshness"] = _freshness(updated, current_time, ttl_seconds)
 
-        state_queries = _state_queries_from_environment(vision, appliances)
+        state_queries = _state_queries_from_environment(appliances)
         sources = {
             HOME_ASSISTANT_SOURCE: _node_source_state(
                 nodes.get(HOME_ASSISTANT_BRIDGE_SOURCE),
@@ -680,13 +700,9 @@ def _appliance_state(action_id: str, effect: dict[str, Any] | None) -> str | Non
 
 
 def _state_queries_from_environment(
-    vision: dict[str, dict[str, Any]],
     appliances: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    return {
-        "room_light": _room_light_state_query(vision.get("room_light")),
-        AIRCON_STATUS_QUERY_ID: _aircon_status_query(appliances.get("aircon")),
-    }
+    return {AIRCON_STATUS_QUERY_ID: _aircon_status_query(appliances.get("aircon"))}
 
 
 def _aircon_status_query(aircon: object) -> dict[str, Any]:
@@ -903,159 +919,174 @@ def _aircon_status_answer_hint(
     return "Home Control/HAの読み取り専用状態でエアコン状態を要約しています。"
 
 
-def _room_light_state_query(room_light: object) -> dict[str, Any]:
-    if not isinstance(room_light, dict):
-        return {
-            "available": False,
-            "stale": True,
-            "stale_reason": "room_light_missing",
-            "state": "unknown",
-            "confidence_label": "none",
-            "answer_hint": "現在のセンサー情報では確認できない。",
-            "authority": VISION_SNAPSHOT_PROCESSOR_SOURCE,
-            "projected_by": "environment_state_server",
-            "observed_at": None,
-            "updated_at": None,
-            "source_snapshot_id": "",
-            "freshness": {
-                "level": "stale",
-                "age_ms": None,
-                "ttl_ms": 0,
-                "updated_at": None,
-                "reason": "room_light_missing",
-            },
-            "evidence": {
-                "reason": "room_light_missing",
-                "topic": "/vision/room_light/state",
-            },
-        }
-
-    stale = bool(room_light.get("stale", True))
-    state = _room_light_state(room_light.get("state"))
-    confidence = _optional_float(room_light.get("confidence"))
-    lighting_type = _room_light_text(room_light.get("lighting_type"), default="unknown")
-    daylight_state = _room_light_text(room_light.get("daylight_state"), default="unknown")
-    electric_on_probability = _room_light_probability(room_light, "electric_on", "electric_light")
-    daylight_present_probability = _room_light_probability(room_light, "daylight_present", "daylight")
-    dark_probability = _room_light_probability(room_light, "dark", None)
-
-    evidence = {
-        "source": _room_light_text(room_light.get("source"), default="unknown"),
-        "topic": _room_light_text(room_light.get("topic"), default="/vision/room_light/state"),
-        "lighting_type": lighting_type,
-        "daylight_state": daylight_state,
-        "electric_on_probability": electric_on_probability,
-        "daylight_present_probability": daylight_present_probability,
-        "dark_probability": dark_probability,
-        "confidence": confidence,
-        "observed_at": room_light.get("observed_at"),
-        "updated_at": room_light.get("updated_at"),
-        "model": room_light.get("model") if isinstance(room_light.get("model"), dict) else {},
-        "sequence": room_light.get("sequence") if isinstance(room_light.get("sequence"), dict) else {},
-    }
-    freshness = room_light.get("freshness") if isinstance(room_light.get("freshness"), dict) else {}
-
-    return {
-        "available": not stale,
-        "stale": stale,
-        "stale_reason": "room_light_stale" if stale else "",
-        "state": state,
-        "confidence_label": _room_light_confidence_label(confidence, available=not stale),
-        "answer_hint": _room_light_answer_hint(
-            available=not stale,
-            stale=stale,
-            state=state,
-            lighting_type=lighting_type,
-            daylight_state=daylight_state,
-        ),
-        "authority": VISION_SNAPSHOT_PROCESSOR_SOURCE,
-        "projected_by": "environment_state_server",
-        "observed_at": room_light.get("observed_at"),
-        "updated_at": room_light.get("updated_at"),
-        "source_snapshot_id": _room_light_source_snapshot_id(room_light),
-        "freshness": deepcopy(freshness),
-        "evidence": evidence,
-    }
-
-
-def _room_light_state(value: object) -> str:
-    state = str(value or "").strip().lower()
-    return state if state in {"on", "off", "unknown"} else "unknown"
-
-
-def _room_light_text(value: object, *, default: str) -> str:
-    text = str(value or "").strip()
-    return text if text else default
-
-
-def _room_light_probability(
-    room_light: dict[str, Any],
-    probability_key: str,
-    fallback_group: str | None,
-) -> float | None:
-    probabilities = room_light.get("probabilities") if isinstance(room_light.get("probabilities"), dict) else {}
-    probability = _optional_float(probabilities.get(probability_key))
-    if probability is not None or fallback_group is None:
-        return probability
-    group = room_light.get(fallback_group) if isinstance(room_light.get(fallback_group), dict) else {}
-    return _optional_float(group.get("probability"))
-
-
-def _room_light_source_snapshot_id(room_light: dict[str, Any]) -> str:
-    observation_id = str(room_light.get("observation_id") or "").strip()
-    if observation_id:
-        return observation_id
-    camera_frame_id = str(room_light.get("camera_frame_id") or "").strip()
-    frame_id = room_light.get("frame_id")
-    if camera_frame_id and frame_id is not None:
-        return f"{camera_frame_id}:{frame_id}"
-    sequence = room_light.get("sequence") if isinstance(room_light.get("sequence"), dict) else {}
-    last_frame_id = sequence.get("last_frame_id")
-    if last_frame_id is not None:
-        return f"frame:{last_frame_id}"
-    updated_at = str(room_light.get("updated_at") or "").strip()
-    return updated_at
-
-
-def _room_light_confidence_label(confidence: float | None, *, available: bool) -> str:
-    if not available:
-        return "none"
-    value = confidence or 0.0
-    if value >= 0.75:
-        return "high"
-    if value >= 0.45:
-        return "medium"
-    return "low"
-
-
-def _room_light_answer_hint(
+def _canonical_room_light_observation(
+    envelope: dict[str, Any],
+    payload: dict[str, Any],
     *,
-    available: bool,
-    stale: bool,
-    state: str,
-    lighting_type: str,
-    daylight_state: str,
-) -> str:
-    if not available:
-        if stale:
-            return "現在のセンサー情報では確認できない。直近の映像推定が古くなっています。"
-        return "現在のセンサー情報では確認できない。"
-    if state == "on":
-        return "照明が点いている可能性が高い。"
-    if state == "off":
-        return "照明が消えている可能性が高い。"
+    source: object,
+) -> tuple[datetime, str, dict[str, Any]] | None:
+    if type(envelope.get("schema_version")) is not int or envelope["schema_version"] != SCHEMA_VERSION:
+        return None
+    if envelope.get("topic") != ROOM_LIGHT_TOPIC:
+        return None
+    if envelope.get("msg_type") != ROOM_LIGHT_MSG_TYPE:
+        return None
+    header = envelope.get("header")
+    if not isinstance(header, dict):
+        return None
+    header_sequence = header.get("seq")
+    if (
+        type(header_sequence) is not int
+        or header_sequence < 0
+        or header_sequence > ROOM_LIGHT_HEADER_SEQUENCE_MAX
+    ):
+        return None
+    received_at = _room_light_numeric_timestamp(header.get("stamp"))
+    camera_frame_id = _canonical_room_light_text(header.get("frame_id"))
+    if received_at is None or camera_frame_id is None:
+        return None
+    source_id = source if source in {CAMERA_HUB_SOURCE, VISION_SNAPSHOT_PROCESSOR_SOURCE} else None
+    if source_id is None:
+        return None
 
-    lighting = lighting_type.lower()
-    daylight = daylight_state.lower()
-    if lighting == "daylight" or daylight == "present":
-        return "映像推定では断定できない。日光の影響が強そう。"
-    if lighting == "mixed":
-        return "映像推定では断定できない。日光と照明が混ざっている可能性がある。"
-    if lighting == "dark":
-        return "映像推定では断定できないが、暗い状態として観測されている。"
-    if lighting == "electric":
-        return "映像推定では照明らしい成分はあるが、断定できない。"
-    return "映像推定では断定できない。"
+    if payload.get("type") != "room_light_observation":
+        return None
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != SCHEMA_VERSION:
+        return None
+    if payload.get("observation_bucket") not in {"dark", "dim", "balanced", "bright"}:
+        return None
+    if not _is_unit_interval_number(payload.get("confidence")):
+        return None
+    if payload.get("daylight_ambiguity") not in {"low", "medium", "high"}:
+        return None
+    cues = payload.get("cue_likelihoods")
+    if not isinstance(cues, dict):
+        return None
+    if not all(
+        cue in cues and _is_unit_interval_number(cues[cue])
+        for cue in ("warm_light", "daylight", "darkness")
+    ):
+        return None
+    if payload.get("source") != VISION_SNAPSHOT_PROCESSOR_SOURCE:
+        return None
+    if payload.get("source_class") != ROOM_LIGHT_SOURCE_CLASS:
+        return None
+    observed_at = _room_light_observed_at(payload.get("observed_at"))
+    observation_id = _canonical_room_light_text(payload.get("observation_id"))
+    if observed_at is None or observation_id is None:
+        return None
+
+    sequence = payload.get("sequence")
+    if not isinstance(sequence, dict):
+        return None
+    frame_count = sequence.get("frame_count")
+    first_frame_id = sequence.get("first_frame_id")
+    last_frame_id = sequence.get("last_frame_id")
+    temporal_window_ms = sequence.get("temporal_window_ms")
+    if type(frame_count) is not int or frame_count <= 0:
+        return None
+    if type(first_frame_id) is not int or first_frame_id < 0:
+        return None
+    if type(last_frame_id) is not int or last_frame_id < 0:
+        return None
+    if type(temporal_window_ms) is not int or temporal_window_ms < 0:
+        return None
+    if first_frame_id > last_frame_id or frame_count > last_frame_id - first_frame_id + 1:
+        return None
+
+    model = payload.get("model")
+    if not isinstance(model, dict):
+        return None
+    if model.get("name") != ROOM_LIGHT_MODEL_NAME or model.get("kind") != ROOM_LIGHT_MODEL_KIND:
+        return None
+    if payload.get("proof_ceiling") != ROOM_LIGHT_PROOF_CEILING:
+        return None
+    if payload.get("does_not_prove") != list(ROOM_LIGHT_DOES_NOT_PROVE):
+        return None
+
+    source_snapshot_id = observation_id
+    return received_at, source_id, {
+        "updated_at": to_iso(received_at),
+        "source": source_id,
+        "topic": ROOM_LIGHT_TOPIC,
+        "frame_id": header_sequence,
+        "camera_frame_id": camera_frame_id,
+        "schema_version": SCHEMA_VERSION,
+        "type": "room_light_observation",
+        "observation_bucket": payload["observation_bucket"],
+        "confidence": payload["confidence"],
+        "daylight_ambiguity": payload["daylight_ambiguity"],
+        "cue_likelihoods": {
+            "warm_light": cues["warm_light"],
+            "daylight": cues["daylight"],
+            "darkness": cues["darkness"],
+        },
+        "source_class": ROOM_LIGHT_SOURCE_CLASS,
+        "observed_at": to_iso(observed_at),
+        "observation_id": observation_id,
+        "source_snapshot_id": source_snapshot_id,
+        "sequence": {
+            "frame_count": frame_count,
+            "first_frame_id": first_frame_id,
+            "last_frame_id": last_frame_id,
+            "temporal_window_ms": temporal_window_ms,
+        },
+        "model": {
+            "name": ROOM_LIGHT_MODEL_NAME,
+            "kind": ROOM_LIGHT_MODEL_KIND,
+        },
+        "provenance": {
+            "source": source_id,
+            "source_class": ROOM_LIGHT_SOURCE_CLASS,
+            "producer": VISION_SNAPSHOT_PROCESSOR_SOURCE,
+            "topic": ROOM_LIGHT_TOPIC,
+            "source_snapshot_id": source_snapshot_id,
+        },
+        "proof_ceiling": ROOM_LIGHT_PROOF_CEILING,
+        "does_not_prove": list(ROOM_LIGHT_DOES_NOT_PROVE),
+    }
+
+
+def _is_unit_interval_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return 0 <= value <= 1 and math.isfinite(value)
+
+
+def _room_light_numeric_timestamp(value: object) -> datetime | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        stamp = float(value)
+        if not math.isfinite(stamp):
+            return None
+        return datetime.fromtimestamp(stamp, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _room_light_observed_at(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _canonical_room_light_text(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > ROOM_LIGHT_IDENTIFIER_MAX_LENGTH:
+        return None
+    text = value.strip()
+    if not text or not all(char.isprintable() for char in text):
+        return None
+    return text
 
 
 def _vision_update_from_topic(
@@ -1073,32 +1104,6 @@ def _vision_update_from_topic(
         "frame_id": header.get("seq"),
         "camera_frame_id": header.get("frame_id"),
     }
-    if topic == "/vision/room_light/state":
-        electric = payload.get("electric_light") if isinstance(payload.get("electric_light"), dict) else {}
-        daylight = payload.get("daylight") if isinstance(payload.get("daylight"), dict) else {}
-        sequence = payload.get("sequence") if isinstance(payload.get("sequence"), dict) else {}
-        evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
-        return "room_light", {
-            **base,
-            "state": electric.get("state") or payload.get("state") or payload.get("label") or "unknown",
-            "label": payload.get("label") or "unknown",
-            "confidence": _optional_float(payload.get("confidence")),
-            "lighting_type": payload.get("lighting_type") or "unknown",
-            "probabilities": payload.get("probabilities") if isinstance(payload.get("probabilities"), dict) else {},
-            "electric_light": electric,
-            "daylight": daylight,
-            "daylight_state": daylight.get("state") or "unknown",
-            "observed_at": payload.get("observed_at") or to_iso(observed),
-            "observation_id": payload.get("observation_id"),
-            "sequence": {
-                "frame_count": sequence.get("frame_count"),
-                "first_frame_id": sequence.get("first_frame_id"),
-                "last_frame_id": sequence.get("last_frame_id"),
-                "temporal_window_ms": sequence.get("temporal_window_ms"),
-            },
-            "model": payload.get("model") if isinstance(payload.get("model"), dict) else evidence.get("model", {}),
-            "evidence": evidence,
-        }
     if topic == "/vision/sword_sign/state":
         gestures = payload.get("gestures", {})
         if not isinstance(gestures, dict):

@@ -300,11 +300,8 @@ class EnvironmentRequestHandler(BaseHTTPRequestHandler):
     def _environment_current(self, query: dict[str, list[str]]) -> dict[str, Any]:
         wait_for = (_first_query_value(query, "wait_for") or "").strip()
         if not wait_for:
-            return _attach_state_query_learning(
-                self.server.store.current(),
-                self.server.feedback_store,
-            )
-        if wait_for != "room_light":
+            return self.server.store.current()
+        if wait_for != "vision.room_light":
             raise ValueError("unsupported_wait_for")
 
         after_text = (_first_query_value(query, "after") or "").strip()
@@ -314,10 +311,7 @@ class EnvironmentRequestHandler(BaseHTTPRequestHandler):
         reason = ""
 
         while True:
-            current = _attach_state_query_learning(
-                self.server.store.current(),
-                self.server.feedback_store,
-            )
+            current = self.server.store.current()
             matched, observed_at = _room_light_matches_after(current, after)
             if matched:
                 reason = "matched"
@@ -332,7 +326,7 @@ class EnvironmentRequestHandler(BaseHTTPRequestHandler):
             time.sleep(min(0.05, max(0.0, (timeout_ms - elapsed_ms) / 1000.0)))
 
         current["wait_result"] = {
-            "target": "room_light",
+            "target": "vision.room_light",
             "after": after_text,
             "timeout_ms": timeout_ms,
             "matched": matched,
@@ -439,7 +433,7 @@ def _parse_timestamp(value: str) -> datetime | None:
 
 
 def _room_light_matches_after(current: dict[str, Any], after: datetime | None) -> tuple[bool, str]:
-    room_light = current.get("state_queries", {}).get("room_light")
+    room_light = current.get("vision", {}).get("room_light")
     if not isinstance(room_light, dict):
         return False, ""
     observed_text = str(room_light.get("observed_at") or "")
@@ -452,30 +446,3 @@ def _room_light_matches_after(current: dict[str, Any], after: datetime | None) -
     if not source_snapshot_id:
         return False, observed_text
     return observed > after, observed_text
-
-
-def _attach_state_query_learning(
-    current: dict[str, Any],
-    feedback_store: StateQueryFeedbackStore | None,
-) -> dict[str, Any]:
-    if feedback_store is None:
-        return current
-    state_queries = current.get("state_queries")
-    if not isinstance(state_queries, dict):
-        return current
-    room_light = state_queries.get("room_light")
-    if not isinstance(room_light, dict):
-        return current
-    try:
-        summary = feedback_store.summary(target="room_light")
-        learning = summary.get("learning")
-    except Exception:
-        return current
-    if isinstance(learning, dict):
-        room_light["learning"] = learning
-    return current
-
-
-def _room_light_state(value: object) -> str:
-    state = str(value or "").strip().lower()
-    return state if state in {"on", "off", "unknown"} else "unknown"

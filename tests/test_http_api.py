@@ -15,6 +15,61 @@ from environment_state_server.http_api import EnvironmentHttpServer
 from environment_state_server.state import EnvironmentStateStore
 
 
+ROOM_LIGHT_DOES_NOT_PROVE = [
+    "physical_room_light_state",
+    "home_assistant_light_state",
+]
+
+
+def _room_light_envelope(
+    observed: datetime,
+    *,
+    received: datetime | None = None,
+    seq: int = 12,
+    bucket: str = "balanced",
+    confidence: float = 0.6,
+    ambiguity: str = "medium",
+    cues: dict[str, float] | None = None,
+    observation_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "topic": "/vision/room_light/observation",
+        "msg_type": "vision_snapshot_processor/RoomLightObservation",
+        "header": {
+            "seq": seq,
+            "stamp": (received or observed).timestamp(),
+            "frame_id": "cam0",
+        },
+        "payload": {
+            "type": "room_light_observation",
+            "schema_version": 1,
+            "observation_bucket": bucket,
+            "confidence": confidence,
+            "daylight_ambiguity": ambiguity,
+            "cue_likelihoods": cues
+            if cues is not None
+            else {"warm_light": 0.2, "daylight": 0.7, "darkness": 0.1},
+            "source": "vision_snapshot_processor",
+            "source_class": "camera_environment_estimate",
+            "observed_at": observed.isoformat(),
+            "observation_id": observation_id or f"obs-{seq}",
+            "sequence": {
+                "frame_count": 2,
+                "first_frame_id": seq - 1,
+                "last_frame_id": seq,
+                "temporal_window_ms": 1000,
+            },
+            "model": {
+                "name": "room-light-heuristic-snapshot-v3",
+                "kind": "heuristic",
+            },
+            "proof_ceiling": "camera_environment_estimate_only",
+            "does_not_prove": list(ROOM_LIGHT_DOES_NOT_PROVE),
+        },
+    }
+
+
 class EnvironmentHttpServerTest(unittest.TestCase):
     def test_environment_current_requires_bearer_token(self) -> None:
         store = EnvironmentStateStore()
@@ -48,25 +103,18 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
-    def test_environment_current_projects_room_light_learning(self) -> None:
+    def test_environment_current_keeps_feedback_separate_from_room_light_observation(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         observed = datetime.now(UTC)
         store.ingest_vision_envelope(
-            {
-                "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 12,
-                    "stamp": observed.timestamp(),
-                    "frame_id": "cam0",
-                },
-                "payload": {
-                    "state": "unknown",
-                    "confidence": 0.2,
-                    "lighting_type": "daylight",
-                    "daylight_state": "present",
-                    "sequence": {"last_frame_id": 12},
-                },
-            },
+            _room_light_envelope(
+                observed,
+                seq=12,
+                bucket="balanced",
+                confidence=0.6,
+                ambiguity="high",
+                cues={"warm_light": 0.2, "daylight": 0.8, "darkness": 0.1},
+            ),
             source="vision_snapshot_processor",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -80,7 +128,7 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                     "predicted_state": "unknown",
                     "predicted_confidence_label": "low",
                     "user_label": "on",
-                    "user_text": "ついてる",
+                    "user_text": "on",
                     "feedback_reason": "user_correction_after_state_query",
                     "source_context": "state_query",
                 }
@@ -99,100 +147,18 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 with urllib.request.urlopen(request, timeout=2) as response:
                     body = json.loads(response.read().decode("utf-8"))
 
-                learning = body["state_queries"]["room_light"]["learning"]
-                self.assertEqual(learning["level"], "collecting")
-                self.assertEqual(learning["accepted_count"], 1)
-                self.assertEqual(learning["label_balance"]["on"], 1)
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=2)
-
-    def test_environment_current_keeps_room_light_learning_non_authoritative(self) -> None:
-        store = EnvironmentStateStore(ttl_ms=5000)
-        observed = datetime.now(UTC)
-        store.ingest_home_assistant_event(
-            {
-                "event": "execute_succeeded",
-                "action_id": "light_on",
-                "execution_id": "exec-light-on",
-                "request_id": "ha-light-on",
-                "executed": True,
-                "status": "submitted",
-                "timestamp": observed.isoformat(),
-                "expected_effect": {
-                    "domain": "switch",
-                    "service": "turn_on",
-                    "entity_id": "switch.demo_light",
-                    "expected_state": "on",
-                },
-            }
-        )
-        store.ingest_vision_envelope(
-            {
-                "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 12,
-                    "stamp": observed.timestamp(),
-                    "frame_id": "cam0",
-                },
-                "payload": {
-                    "state": "unknown",
-                    "confidence": 0.1,
-                    "lighting_type": "daylight",
-                    "daylight_state": "present",
-                    "sequence": {"last_frame_id": 12},
-                },
-            },
-            source="vision_snapshot_processor",
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            feedback_store = StateQueryFeedbackStore(Path(temp_dir) / "state-query-feedback.jsonl")
-            for index, label in enumerate(["on", "off"] * 6, start=1):
-                feedback_store.append(
-                    {
-                        "target": "room_light",
-                        "state_query_id": "room_light",
-                        "idempotency_key": f"state-query-feedback:test:calibration:{index}:{label}",
-                        "snapshot_id": f"env-calibration-{index}",
-                        "predicted_state": "unknown",
-                        "predicted_confidence_label": "low",
-                        "user_label": label,
-                        "user_text": "ついてる" if label == "on" else "消えてる",
-                        "feedback_reason": "user_correction_after_light_action",
-                        "source_context": "post_light_action",
-                        "action_id": "light_on" if label == "on" else "light_off",
-                        "expected_state": label,
-                    }
+                room_light = body["vision"]["room_light"]
+                self.assertEqual(room_light["type"], "room_light_observation")
+                self.assertNotIn("learning", room_light)
+                self.assertNotIn("room_light", body["state_queries"])
+                self.assertEqual(
+                    feedback_store.summary(target="room_light")["learning"]["accepted_count"],
+                    1,
                 )
-            server = EnvironmentHttpServer(
-                ("127.0.0.1", 0),
-                store=store,
-                api_token="secret",
-                feedback_store=feedback_store,
-            )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                url = f"http://127.0.0.1:{server.server_port}/environment/current"
-                request = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
-                with urllib.request.urlopen(request, timeout=2) as response:
-                    body = json.loads(response.read().decode("utf-8"))
-
-                room_light = body["state_queries"]["room_light"]
-                self.assertEqual(room_light["state"], "unknown")
-                self.assertEqual(room_light["confidence_label"], "low")
-                self.assertEqual(room_light["learning"]["level"], "reinforced")
-                self.assertNotIn("effective_state", room_light)
-                self.assertNotIn("effective_confidence_label", room_light)
-                self.assertNotIn("effective_authority", room_light)
-                self.assertNotIn("effective_answer_hint", room_light)
-                self.assertNotIn("calibration", room_light)
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
-
     def test_indicators_current_is_public_and_sanitized(self) -> None:
         store = EnvironmentStateStore()
         server = EnvironmentHttpServer(("127.0.0.1", 0), store=store, api_token="secret")
@@ -241,26 +207,19 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
-    def test_environment_current_waits_for_room_light_after_timestamp(self) -> None:
+    def test_environment_current_waits_for_vision_room_light_after_timestamp(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         observed = datetime.now(UTC)
         after_time = observed - timedelta(seconds=1)
         store.ingest_vision_envelope(
-            {
-                "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 12,
-                    "stamp": observed.timestamp(),
-                    "frame_id": "cam0",
-                },
-                "payload": {
-                    "state": "on",
-                    "confidence": 0.92,
-                    "lighting_type": "electric",
-                    "electric_light": {"state": "on", "probability": 0.92},
-                    "sequence": {"last_frame_id": 12},
-                },
-            },
+            _room_light_envelope(
+                observed,
+                seq=12,
+                bucket="bright",
+                confidence=0.92,
+                ambiguity="low",
+                cues={"warm_light": 0.9, "daylight": 0.1, "darkness": 0.0},
+            ),
             source="vision_snapshot_processor",
         )
         server = EnvironmentHttpServer(("127.0.0.1", 0), store=store, api_token="secret")
@@ -271,7 +230,7 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             after = urllib.parse.quote(after_text, safe="")
             url = (
                 f"http://127.0.0.1:{server.server_port}/environment/current"
-                f"?wait_for=room_light&after={after}&timeout_ms=1500"
+                f"?wait_for=vision.room_light&after={after}&timeout_ms=1500"
             )
             request = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
             with urllib.request.urlopen(request, timeout=2) as response:
@@ -279,38 +238,32 @@ class EnvironmentHttpServerTest(unittest.TestCase):
 
             self.assertEqual(response.status, 200)
             self.assertTrue(body["wait_result"]["matched"])
-            self.assertEqual(body["wait_result"]["target"], "room_light")
+            self.assertEqual(body["wait_result"]["target"], "vision.room_light")
             self.assertEqual(body["wait_result"]["reason"], "matched")
             self.assertEqual(body["wait_result"]["timeout_ms"], 1500)
             self.assertEqual(body["wait_result"]["after"], after_text)
             self.assertEqual(body["wait_result"]["observed_at"], observed.isoformat())
-            room_light = body["state_queries"]["room_light"]
-            self.assertEqual(room_light["updated_at"], observed.isoformat())
-            self.assertEqual(room_light["source_snapshot_id"], "cam0:12")
-            self.assertEqual(room_light["stale_reason"], "")
+            room_light = body["vision"]["room_light"]
+            self.assertEqual(room_light["observed_at"], observed.isoformat())
+            self.assertEqual(room_light["source_snapshot_id"], "obs-12")
+            self.assertNotIn("room_light", body["state_queries"])
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
-
-    def test_environment_current_wait_for_room_light_times_out_with_current_snapshot(self) -> None:
+    def test_environment_current_wait_for_vision_room_light_times_out_with_current_snapshot(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         observed = datetime.now(UTC)
         after_time = observed + timedelta(seconds=1)
         store.ingest_vision_envelope(
-            {
-                "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 12,
-                    "stamp": observed.timestamp(),
-                    "frame_id": "cam0",
-                },
-                "payload": {
-                    "state": "unknown",
-                    "confidence": 0.0,
-                    "electric_light": {"state": "unknown"},
-                },
-            },
+            _room_light_envelope(
+                observed,
+                seq=12,
+                bucket="balanced",
+                confidence=0.4,
+                ambiguity="high",
+                cues={"warm_light": 0.2, "daylight": 0.7, "darkness": 0.1},
+            ),
             source="vision_snapshot_processor",
         )
         server = EnvironmentHttpServer(("127.0.0.1", 0), store=store, api_token="secret")
@@ -320,7 +273,7 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             after = urllib.parse.quote(after_time.isoformat(), safe="")
             url = (
                 f"http://127.0.0.1:{server.server_port}/environment/current"
-                f"?wait_for=room_light&after={after}&timeout_ms=20"
+                f"?wait_for=vision.room_light&after={after}&timeout_ms=20"
             )
             request = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
             with urllib.request.urlopen(request, timeout=2) as response:
@@ -328,46 +281,84 @@ class EnvironmentHttpServerTest(unittest.TestCase):
 
             self.assertEqual(response.status, 200)
             self.assertFalse(body["wait_result"]["matched"])
-            self.assertEqual(body["wait_result"]["target"], "room_light")
+            self.assertEqual(body["wait_result"]["target"], "vision.room_light")
             self.assertEqual(body["wait_result"]["reason"], "timeout")
             self.assertEqual(body["wait_result"]["timeout_ms"], 20)
             self.assertEqual(body["wait_result"]["observed_at"], observed.isoformat())
+            self.assertEqual(body["vision"]["room_light"]["source_snapshot_id"], "obs-12")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+    def test_environment_current_wait_for_vision_room_light_uses_observed_at(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        observed = datetime.now(UTC) - timedelta(seconds=2)
+        received = datetime.now(UTC)
+        after_time = observed + timedelta(seconds=1)
+        store.ingest_vision_envelope(
+            _room_light_envelope(
+                observed,
+                received=received,
+                seq=13,
+                bucket="bright",
+                confidence=0.9,
+                ambiguity="low",
+                cues={"warm_light": 0.9, "daylight": 0.1, "darkness": 0.0},
+            ),
+            source="vision_snapshot_processor",
+        )
+        server = EnvironmentHttpServer(("127.0.0.1", 0), store=store, api_token="secret")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            after = urllib.parse.quote(after_time.isoformat(), safe="")
+            url = (
+                f"http://127.0.0.1:{server.server_port}/environment/current"
+                f"?wait_for=vision.room_light&after={after}&timeout_ms=20"
+            )
+            request = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
+            with urllib.request.urlopen(request, timeout=2) as response:
+                body = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(response.status, 200)
+            self.assertFalse(body["wait_result"]["matched"])
+            self.assertEqual(body["wait_result"]["reason"], "timeout")
+            self.assertEqual(body["wait_result"]["observed_at"], observed.isoformat())
+            room_light = body["vision"]["room_light"]
+            self.assertEqual(room_light["observed_at"], observed.isoformat())
+            self.assertEqual(room_light["source_snapshot_id"], "obs-13")
+            self.assertIn("updated_at", room_light)
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
 
-    def test_environment_current_wait_for_room_light_uses_observed_at_not_updated_at(self) -> None:
+    def test_environment_current_wait_rejects_invalid_room_light_observation(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
-        observed = datetime.now(UTC) - timedelta(seconds=2)
-        updated = datetime.now(UTC)
-        after_time = observed + timedelta(seconds=1)
+        observed = datetime.now(UTC)
+        envelope = _room_light_envelope(
+            observed,
+            seq=14,
+            bucket="bright",
+            confidence=0.9,
+            ambiguity="low",
+            cues={"warm_light": 0.9, "daylight": 0.1, "darkness": 0.0},
+        )
+        payload = envelope["payload"]
+        assert isinstance(payload, dict)
+        payload.pop("proof_ceiling")
         store.ingest_vision_envelope(
-            {
-                "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 13,
-                    "stamp": updated.timestamp(),
-                    "frame_id": "cam0",
-                },
-                "payload": {
-                    "state": "on",
-                    "confidence": 0.9,
-                    "observed_at": observed.isoformat(),
-                    "electric_light": {"state": "on", "probability": 0.9},
-                    "sequence": {"last_frame_id": 13},
-                },
-            },
+            envelope,
             source="vision_snapshot_processor",
         )
         server = EnvironmentHttpServer(("127.0.0.1", 0), store=store, api_token="secret")
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            after = urllib.parse.quote(after_time.isoformat(), safe="")
+            after = urllib.parse.quote((observed - timedelta(seconds=1)).isoformat(), safe="")
             url = (
                 f"http://127.0.0.1:{server.server_port}/environment/current"
-                f"?wait_for=room_light&after={after}&timeout_ms=20"
+                f"?wait_for=vision.room_light&after={after}&timeout_ms=20"
             )
             request = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
             with urllib.request.urlopen(request, timeout=2) as response:
@@ -376,10 +367,10 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertFalse(body["wait_result"]["matched"])
             self.assertEqual(body["wait_result"]["reason"], "timeout")
-            self.assertEqual(body["wait_result"]["observed_at"], observed.isoformat())
-            room_light = body["state_queries"]["room_light"]
-            self.assertGreater(room_light["updated_at"], after_time.isoformat())
-            self.assertEqual(room_light["source_snapshot_id"], "cam0:13")
+            self.assertEqual(body["wait_result"]["observed_at"], "")
+            self.assertNotIn("room_light", body["vision"])
+            self.assertNotIn("vision_snapshot_processor", body["sources"])
+            self.assertIsNone(body["observed_at"])
         finally:
             server.shutdown()
             server.server_close()

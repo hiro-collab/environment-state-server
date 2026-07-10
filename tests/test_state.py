@@ -2,9 +2,60 @@ from __future__ import annotations
 
 import json
 import unittest
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
 from environment_state_server.state import EnvironmentStateStore
+
+
+ROOM_LIGHT_DOES_NOT_PROVE = [
+    "physical_room_light_state",
+    "home_assistant_light_state",
+]
+
+
+def _room_light_envelope(
+    observed: datetime,
+    *,
+    seq: int = 42,
+    frame_id: str = "camera",
+    bucket: str = "balanced",
+    confidence: float = 0.6,
+    ambiguity: str = "medium",
+    cues: dict[str, float] | None = None,
+    observation_id: str = "obs-1",
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "topic": "/vision/room_light/observation",
+        "msg_type": "vision_snapshot_processor/RoomLightObservation",
+        "header": {"seq": seq, "stamp": observed.timestamp(), "frame_id": frame_id},
+        "payload": {
+            "type": "room_light_observation",
+            "schema_version": 1,
+            "observation_bucket": bucket,
+            "confidence": confidence,
+            "daylight_ambiguity": ambiguity,
+            "cue_likelihoods": cues
+            or {"warm_light": 0.2, "daylight": 0.7, "darkness": 0.1},
+            "source": "vision_snapshot_processor",
+            "source_class": "camera_environment_estimate",
+            "observed_at": observed.isoformat(),
+            "observation_id": observation_id,
+            "sequence": {
+                "frame_count": 2,
+                "first_frame_id": seq - 1,
+                "last_frame_id": seq,
+                "temporal_window_ms": 1000,
+            },
+            "model": {
+                "name": "room-light-heuristic-snapshot-v3",
+                "kind": "heuristic",
+            },
+            "proof_ceiling": "camera_environment_estimate_only",
+            "does_not_prove": list(ROOM_LIGHT_DOES_NOT_PROVE),
+        },
+    }
 
 
 class EnvironmentStateStoreTest(unittest.TestCase):
@@ -351,221 +402,229 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         self.assertEqual(stale["freshness"]["level"], "stale")
         self.assertEqual(stale["appliances"]["fan"]["freshness"]["level"], "stale")
 
-    def test_camera_room_light_topic_updates_vision_state(self) -> None:
+    def test_room_light_observation_updates_canonical_vision_state(self) -> None:
+        store = EnvironmentStateStore(ttl_ms=5000)
+        observed = datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC)
+        envelope = _room_light_envelope(
+            observed,
+            bucket="bright",
+            confidence=0.82,
+            cues={"warm_light": 0.7, "daylight": 0.6, "darkness": 0.05},
+        )
+        header = envelope["header"]
+        payload = envelope["payload"]
+        assert isinstance(header, dict)
+        assert isinstance(payload, dict)
+        assert isinstance(payload["cue_likelihoods"], dict)
+        assert isinstance(payload["sequence"], dict)
+        assert isinstance(payload["model"], dict)
+        header["private_header"] = {"api_key": "header-secret"}
+        payload["cue_likelihoods"]["private_cue"] = "cue-secret"
+        payload["sequence"]["private_sequence"] = "sequence-secret"
+        payload["model"]["private_model"] = "model-secret"
+        payload["source_snapshot_id"] = "caller-private-snapshot"
+        payload["producer"] = {"private_producer": "producer-secret"}
+        store.ingest_camera_hub_envelope(envelope)
+
+        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
+        room_light = current["vision"]["room_light"]
+
+        self.assertEqual(room_light["type"], "room_light_observation")
+        self.assertEqual(room_light["observation_bucket"], "bright")
+        self.assertEqual(room_light["confidence"], 0.82)
+        self.assertEqual(room_light["daylight_ambiguity"], "medium")
+        self.assertEqual(
+            room_light["cue_likelihoods"],
+            {"warm_light": 0.7, "daylight": 0.6, "darkness": 0.05},
+        )
+        self.assertEqual(room_light["source"], "camera_hub")
+        self.assertEqual(room_light["source_class"], "camera_environment_estimate")
+        self.assertEqual(room_light["observation_id"], "obs-1")
+        self.assertEqual(room_light["source_snapshot_id"], "obs-1")
+        self.assertEqual(
+            room_light["sequence"],
+            {
+                "frame_count": 2,
+                "first_frame_id": 41,
+                "last_frame_id": 42,
+                "temporal_window_ms": 1000,
+            },
+        )
+        self.assertEqual(
+            room_light["model"],
+            {"name": "room-light-heuristic-snapshot-v3", "kind": "heuristic"},
+        )
+        self.assertEqual(room_light["freshness"]["level"], "fresh")
+        self.assertEqual(room_light["freshness"]["age_ms"], 1000)
+        self.assertEqual(room_light["freshness"]["ttl_ms"], 5000)
+        self.assertEqual(room_light["proof_ceiling"], "camera_environment_estimate_only")
+        self.assertEqual(room_light["does_not_prove"], ROOM_LIGHT_DOES_NOT_PROVE)
+        self.assertEqual(
+            room_light["provenance"]["topic"],
+            "/vision/room_light/observation",
+        )
+        self.assertEqual(room_light["provenance"]["producer"], "vision_snapshot_processor")
+        serialized = json.dumps(room_light)
+        for private_value in (
+            "header-secret",
+            "cue-secret",
+            "sequence-secret",
+            "model-secret",
+            "caller-private-snapshot",
+            "producer-secret",
+        ):
+            self.assertNotIn(private_value, serialized)
+        for removed in ("state", "electric_light", "lighting_type", "probabilities", "label"):
+            self.assertNotIn(removed, room_light)
+        self.assertNotIn("room_light", current["state_queries"])
+        self.assertIn("aircon_current_status", current["state_queries"])
+
+    def test_invalid_room_light_observations_are_rejected_without_source_freshness(self) -> None:
+        observed = datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC)
+        valid_envelope = _room_light_envelope(observed)
+        cases = [
+            ("missing_envelope_schema", lambda envelope: envelope.pop("schema_version")),
+            ("wrong_envelope_schema", lambda envelope: envelope.__setitem__("schema_version", 2)),
+            ("boolean_envelope_schema", lambda envelope: envelope.__setitem__("schema_version", True)),
+            ("wrong_topic", lambda envelope: envelope.__setitem__("topic", "/vision/room_light/wrong")),
+            ("missing_msg_type", lambda envelope: envelope.pop("msg_type")),
+            ("wrong_msg_type", lambda envelope: envelope.__setitem__("msg_type", "wrong")),
+            ("missing_header", lambda envelope: envelope.pop("header")),
+            ("header_not_object", lambda envelope: envelope.__setitem__("header", [])),
+            ("seq_boolean", lambda envelope: envelope["header"].__setitem__("seq", True)),
+            ("seq_negative", lambda envelope: envelope["header"].__setitem__("seq", -1)),
+            ("seq_too_large", lambda envelope: envelope["header"].__setitem__("seq", 2**63)),
+            ("stamp_not_numeric", lambda envelope: envelope["header"].__setitem__("stamp", "now")),
+            ("stamp_nonfinite", lambda envelope: envelope["header"].__setitem__("stamp", float("inf"))),
+            ("missing_frame_id", lambda envelope: envelope["header"].pop("frame_id")),
+            ("blank_frame_id", lambda envelope: envelope["header"].__setitem__("frame_id", "   ")),
+            ("control_frame_id", lambda envelope: envelope["header"].__setitem__("frame_id", "cam\n0")),
+            ("payload_not_object", lambda envelope: envelope.__setitem__("payload", [])),
+            ("missing_payload_type", lambda envelope: envelope["payload"].pop("type")),
+            ("wrong_payload_type", lambda envelope: envelope["payload"].__setitem__("type", "wrong")),
+            ("missing_payload_schema", lambda envelope: envelope["payload"].pop("schema_version")),
+            ("wrong_payload_schema", lambda envelope: envelope["payload"].__setitem__("schema_version", 2)),
+            ("boolean_payload_schema", lambda envelope: envelope["payload"].__setitem__("schema_version", True)),
+            ("invalid_bucket", lambda envelope: envelope["payload"].__setitem__("observation_bucket", "unknown")),
+            ("confidence_not_numeric", lambda envelope: envelope["payload"].__setitem__("confidence", "0.6")),
+            ("confidence_boolean", lambda envelope: envelope["payload"].__setitem__("confidence", True)),
+            ("confidence_nonfinite", lambda envelope: envelope["payload"].__setitem__("confidence", float("nan"))),
+            ("confidence_out_of_range", lambda envelope: envelope["payload"].__setitem__("confidence", 1.01)),
+            ("invalid_ambiguity", lambda envelope: envelope["payload"].__setitem__("daylight_ambiguity", "unknown")),
+            ("missing_cues", lambda envelope: envelope["payload"].pop("cue_likelihoods")),
+            ("cues_not_object", lambda envelope: envelope["payload"].__setitem__("cue_likelihoods", [])),
+            ("missing_cue", lambda envelope: envelope["payload"]["cue_likelihoods"].pop("darkness")),
+            ("cue_boolean", lambda envelope: envelope["payload"]["cue_likelihoods"].__setitem__("warm_light", False)),
+            ("cue_nonfinite", lambda envelope: envelope["payload"]["cue_likelihoods"].__setitem__("daylight", float("inf"))),
+            ("cue_out_of_range", lambda envelope: envelope["payload"]["cue_likelihoods"].__setitem__("darkness", -0.01)),
+            ("missing_source", lambda envelope: envelope["payload"].pop("source")),
+            ("wrong_source", lambda envelope: envelope["payload"].__setitem__("source", "camera_hub")),
+            ("missing_source_class", lambda envelope: envelope["payload"].pop("source_class")),
+            ("wrong_source_class", lambda envelope: envelope["payload"].__setitem__("source_class", "private")),
+            ("missing_observed_at", lambda envelope: envelope["payload"].pop("observed_at")),
+            ("invalid_observed_at", lambda envelope: envelope["payload"].__setitem__("observed_at", "not-a-time")),
+            ("missing_observation_id", lambda envelope: envelope["payload"].pop("observation_id")),
+            ("blank_observation_id", lambda envelope: envelope["payload"].__setitem__("observation_id", "   ")),
+            ("control_observation_id", lambda envelope: envelope["payload"].__setitem__("observation_id", "obs\t1")),
+            ("oversized_observation_id", lambda envelope: envelope["payload"].__setitem__("observation_id", "x" * 161)),
+            ("missing_sequence", lambda envelope: envelope["payload"].pop("sequence")),
+            ("sequence_not_object", lambda envelope: envelope["payload"].__setitem__("sequence", [])),
+            ("frame_count_boolean", lambda envelope: envelope["payload"]["sequence"].__setitem__("frame_count", True)),
+            ("frame_count_zero", lambda envelope: envelope["payload"]["sequence"].__setitem__("frame_count", 0)),
+            ("first_frame_id_negative", lambda envelope: envelope["payload"]["sequence"].__setitem__("first_frame_id", -1)),
+            ("last_frame_id_boolean", lambda envelope: envelope["payload"]["sequence"].__setitem__("last_frame_id", False)),
+            ("window_boolean", lambda envelope: envelope["payload"]["sequence"].__setitem__("temporal_window_ms", True)),
+            ("window_negative", lambda envelope: envelope["payload"]["sequence"].__setitem__("temporal_window_ms", -1)),
+            ("first_after_last", lambda envelope: envelope["payload"]["sequence"].__setitem__("first_frame_id", 43)),
+            ("impossible_frame_count", lambda envelope: envelope["payload"]["sequence"].__setitem__("frame_count", 3)),
+            ("missing_model", lambda envelope: envelope["payload"].pop("model")),
+            ("model_not_object", lambda envelope: envelope["payload"].__setitem__("model", [])),
+            ("wrong_model_name", lambda envelope: envelope["payload"]["model"].__setitem__("name", "private-model")),
+            ("wrong_model_kind", lambda envelope: envelope["payload"]["model"].__setitem__("kind", "ml")),
+            ("missing_proof", lambda envelope: envelope["payload"].pop("proof_ceiling")),
+            ("wrong_proof", lambda envelope: envelope["payload"].__setitem__("proof_ceiling", "physical_truth")),
+            ("missing_nonclaims", lambda envelope: envelope["payload"].pop("does_not_prove")),
+            ("nonclaims_not_list", lambda envelope: envelope["payload"].__setitem__("does_not_prove", "physical_room_light_state")),
+            ("wrong_nonclaim", lambda envelope: envelope["payload"]["does_not_prove"].__setitem__(0, "private claim")),
+            ("extra_nonclaim", lambda envelope: envelope["payload"]["does_not_prove"].append("private extra")),
+        ]
+
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                envelope = deepcopy(valid_envelope)
+                mutate(envelope)
+                store = EnvironmentStateStore(ttl_ms=5000)
+                store.ingest_camera_hub_envelope(envelope)
+
+                current = store.current(now=observed + timedelta(seconds=1))
+                self.assertNotIn("room_light", current["vision"])
+                self.assertIsNone(current["observed_at"])
+                self.assertIsNone(current["sources"]["camera_hub"]["updated_at"])
+
+    def test_old_room_light_state_topic_is_not_consumed(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         store.ingest_camera_hub_envelope(
             {
                 "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 42,
-                    "stamp": datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC).timestamp(),
-                    "frame_id": "camera",
-                },
-                "payload": {
-                    "label": "electric_on_daylit",
-                    "confidence": 0.91,
-                    "lighting_type": "mixed",
-                    "electric_light": {"state": "on"},
-                    "daylight": {"state": "present"},
-                    "observation_id": "obs-1",
-                    "sequence": {
-                        "frame_count": 2,
-                        "first_frame_id": 41,
-                        "last_frame_id": 42,
-                        "temporal_window_ms": 1000,
-                    },
-                    "evidence": {
-                        "model": {
-                            "name": "room-light-heuristic-v1",
-                        },
-                    },
-                },
+                "header": {"seq": 42, "stamp": datetime(2026, 5, 6, tzinfo=UTC).timestamp()},
+                "payload": {"state": "on", "electric_light": {"state": "on"}},
             }
         )
 
-        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
+        current = store.current(now=datetime(2026, 5, 6, 0, 0, 1, tzinfo=UTC))
+        self.assertNotIn("room_light", current["vision"])
+        self.assertNotIn("room_light", current["state_queries"])
 
-        room_light = current["vision"]["room_light"]
-        self.assertEqual(room_light["state"], "on")
-        self.assertEqual(room_light["lighting_type"], "mixed")
-        self.assertEqual(room_light["daylight_state"], "present")
-        self.assertEqual(room_light["observation_id"], "obs-1")
-        self.assertEqual(room_light["sequence"]["frame_count"], 2)
-        self.assertEqual(room_light["sequence"]["temporal_window_ms"], 1000)
-        self.assertEqual(room_light["source"], "camera_hub")
-        self.assertEqual(room_light["freshness"]["level"], "fresh")
-        self.assertEqual(room_light["freshness"]["age_ms"], 1000)
-
-        query = current["state_queries"]["room_light"]
-        self.assertTrue(query["available"])
-        self.assertFalse(query["stale"])
-        self.assertEqual(query["state"], "on")
-        self.assertEqual(query["confidence_label"], "high")
-        self.assertIn("点いている", query["answer_hint"])
-        self.assertEqual(query["authority"], "vision_snapshot_processor")
-        self.assertEqual(query["projected_by"], "environment_state_server")
-        self.assertEqual(query["observed_at"], "2026-05-06T14:00:00+00:00")
-        self.assertEqual(query["updated_at"], "2026-05-06T14:00:00+00:00")
-        self.assertEqual(query["source_snapshot_id"], "obs-1")
-        self.assertEqual(query["freshness"]["level"], "fresh")
-        self.assertEqual(query["freshness"]["age_ms"], 1000)
-        self.assertEqual(query["stale_reason"], "")
-        self.assertEqual(query["evidence"]["source"], "camera_hub")
-        self.assertEqual(query["evidence"]["topic"], "/vision/room_light/state")
-
-    def test_vision_snapshot_processor_source_does_not_refresh_camera_hub_source(self) -> None:
+    def test_vision_source_provenance_stays_separate_from_camera_hub_source(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         observed = datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC)
-
         store.ingest_vision_envelope(
-            {
-                "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 42,
-                    "stamp": observed.timestamp(),
-                    "frame_id": "cam0",
-                },
-                "payload": {
-                    "label": "dark",
-                    "confidence": 0.86,
-                    "electric_light": {"state": "off"},
-                    "daylight": {"state": "absent"},
-                    "sequence": {"frame_count": 3},
-                },
-            },
+            _room_light_envelope(
+                observed,
+                frame_id="cam0",
+                ambiguity="high",
+                observation_id="obs-direct",
+            ),
             source="vision_snapshot_processor",
         )
 
         current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
         sources = current["sources"]
-
         self.assertTrue(sources["camera_hub"]["stale"])
-        self.assertFalse(sources["camera_hub"]["available"])
         self.assertFalse(sources["vision_snapshot_processor"]["stale"])
-        self.assertEqual(sources["camera_hub"]["freshness"]["level"], "stale")
-        self.assertEqual(sources["vision_snapshot_processor"]["freshness"]["level"], "fresh")
         self.assertEqual(
             current["vision"]["room_light"]["source"],
             "vision_snapshot_processor",
         )
-
-    def test_room_light_state_query_explains_daylight_unknown(self) -> None:
-        store = EnvironmentStateStore(ttl_ms=5000)
-        observed = datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC)
-
-        store.ingest_vision_envelope(
-            {
-                "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 183,
-                    "stamp": observed.timestamp(),
-                    "frame_id": "cam0",
-                },
-                "payload": {
-                    "state": "unknown",
-                    "label": "daylight",
-                    "confidence": 0.0,
-                    "lighting_type": "daylight",
-                    "probabilities": {
-                        "electric_on": 0.58,
-                        "daylight_present": 0.75,
-                        "dark": 0.13,
-                    },
-                    "electric_light": {"state": "unknown", "probability": 0.58},
-                    "daylight": {"state": "present", "probability": 0.75},
-                    "sequence": {
-                        "frame_count": 2,
-                        "first_frame_id": 182,
-                        "last_frame_id": 183,
-                        "temporal_window_ms": 1000,
-                    },
-                },
-            },
-            source="vision_snapshot_processor",
-        )
-
-        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
-        query = current["state_queries"]["room_light"]
-
-        self.assertTrue(query["available"])
-        self.assertFalse(query["stale"])
-        self.assertEqual(query["state"], "unknown")
-        self.assertEqual(query["confidence_label"], "low")
-        self.assertIn("日光", query["answer_hint"])
-        self.assertEqual(query["authority"], "vision_snapshot_processor")
-        self.assertEqual(query["projected_by"], "environment_state_server")
-        self.assertEqual(query["observed_at"], "2026-05-06T14:00:00+00:00")
-        self.assertEqual(query["updated_at"], "2026-05-06T14:00:00+00:00")
-        self.assertEqual(query["source_snapshot_id"], "cam0:183")
-        self.assertEqual(query["stale_reason"], "")
-        self.assertEqual(query["evidence"]["source"], "vision_snapshot_processor")
-        self.assertAlmostEqual(query["evidence"]["electric_on_probability"], 0.58)
-        self.assertAlmostEqual(query["evidence"]["daylight_present_probability"], 0.75)
-        self.assertAlmostEqual(query["evidence"]["dark_probability"], 0.13)
-        self.assertEqual(query["evidence"]["lighting_type"], "daylight")
-        self.assertEqual(query["evidence"]["daylight_state"], "present")
-
-        indicators = store.indicators_current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
         self.assertEqual(
-            indicators["environment"]["state_queries"]["room_light"]["state"],
-            "unknown",
+            current["vision"]["room_light"]["source_snapshot_id"],
+            "obs-direct",
         )
 
-    def test_room_light_state_query_reports_missing_sensor_state(self) -> None:
-        store = EnvironmentStateStore(ttl_ms=5000)
-
-        current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
-        query = current["state_queries"]["room_light"]
-
-        self.assertFalse(query["available"])
-        self.assertTrue(query["stale"])
-        self.assertEqual(query["state"], "unknown")
-        self.assertEqual(query["confidence_label"], "none")
-        self.assertEqual(query["authority"], "vision_snapshot_processor")
-        self.assertEqual(query["projected_by"], "environment_state_server")
-        self.assertIsNone(query["observed_at"])
-        self.assertIsNone(query["updated_at"])
-        self.assertEqual(query["source_snapshot_id"], "")
-        self.assertEqual(query["freshness"]["level"], "stale")
-        self.assertEqual(query["freshness"]["reason"], "room_light_missing")
-        self.assertEqual(query["stale_reason"], "room_light_missing")
-        self.assertEqual(query["evidence"]["reason"], "room_light_missing")
-
-    def test_room_light_state_query_marks_stale_sensor_state_unavailable(self) -> None:
+    def test_room_light_observation_reports_stale_freshness(self) -> None:
         store = EnvironmentStateStore(ttl_ms=1000)
         observed = datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC)
-
         store.ingest_vision_envelope(
-            {
-                "topic": "/vision/room_light/state",
-                "header": {
-                    "seq": 1,
-                    "stamp": observed.timestamp(),
-                    "frame_id": "cam0",
-                },
-                "payload": {
-                    "state": "on",
-                    "confidence": 0.91,
-                    "lighting_type": "electric",
-                    "electric_light": {"state": "on", "probability": 0.91},
-                    "daylight": {"state": "absent", "probability": 0.12},
-                },
-            },
+            _room_light_envelope(
+                observed,
+                seq=1,
+                frame_id="cam0",
+                bucket="dim",
+                confidence=0.71,
+                ambiguity="low",
+                cues={"warm_light": 0.4, "daylight": 0.1, "darkness": 0.6},
+                observation_id="obs-stale",
+            ),
             source="vision_snapshot_processor",
         )
 
         current = store.current(now=datetime(2026, 5, 6, 14, 0, 2, tzinfo=UTC))
-        query = current["state_queries"]["room_light"]
-
-        self.assertFalse(query["available"])
-        self.assertTrue(query["stale"])
-        self.assertEqual(query["state"], "on")
-        self.assertEqual(query["confidence_label"], "none")
-        self.assertEqual(query["stale_reason"], "room_light_stale")
-        self.assertEqual(query["freshness"]["level"], "stale")
-        self.assertEqual(query["freshness"]["reason"], "age_exceeds_ttl")
-        self.assertIn("古く", query["answer_hint"])
-
+        room_light = current["vision"]["room_light"]
+        self.assertTrue(room_light["stale"])
+        self.assertEqual(room_light["freshness"]["level"], "stale")
+        self.assertEqual(room_light["freshness"]["reason"], "age_exceeds_ttl")
+        self.assertEqual(room_light["freshness"]["ttl_ms"], 1000)
+        self.assertNotIn("room_light", current["state_queries"])
     def test_camera_sword_sign_topic_preserves_primary_and_best_gesture(self) -> None:
         store = EnvironmentStateStore(ttl_ms=5000)
         store.ingest_camera_hub_envelope(
