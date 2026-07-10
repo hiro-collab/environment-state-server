@@ -652,7 +652,6 @@ class EnvironmentStateStoreTest(unittest.TestCase):
 
         relations = store.update_relations(
             {
-                "dify_issue_id": "HCA-1",
                 "ha_request_id": "ha-1",
                 "ha_execution_id": "exec-1",
                 "snapshot_id": "env_1",
@@ -661,7 +660,11 @@ class EnvironmentStateStoreTest(unittest.TestCase):
         )
         current = store.current(now=datetime(2026, 5, 6, 14, 0, 1, tzinfo=UTC))
 
-        self.assertEqual(relations["dify_issue_id"], "HCA-1")
+        self.assertEqual(
+            set(relations),
+            {"ha_request_id", "ha_execution_id", "snapshot_id", "updated_at"},
+        )
+        self.assertEqual(relations["ha_request_id"], "ha-1")
         self.assertEqual(current["relations"]["ha_execution_id"], "exec-1")
         self.assertNotIn("ignored", current["relations"])
 

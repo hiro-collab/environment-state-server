@@ -64,7 +64,7 @@ uv run --env-file $HomeControlEnv python -m environment_state_server.main `
 |---|---|---|---|
 | `GET /environment/current` | Dify | Bearer token | 家電、gesture、camera、module 状態、Dify 向け state query |
 | `GET /environment/current?wait_for=room_light&after=<iso>&timeout_ms=1500` | Dify | Bearer token | 操作後の room-light snapshot を短時間待つ |
-| `GET /environment/relations` | Dify | Bearer token | Dify issue ID と action ID の関連情報 |
+| `POST /environment/relations` | Thought Core | Bearer token | Home Assistant request/execution と snapshot の関連情報 |
 | `POST /feedback/state-query` | Dify | Bearer token | 状態照会へのユーザー訂正ラベルを append-only 保存 |
 | `GET /feedback/state-query/recent` | Dify / debug | Bearer token | 最近の状態照会 feedback を確認 |
 | `GET /feedback/state-query/summary` | Dify / debug | Bearer token | label/status 件数、学習レベル、最新 feedback を確認 |
@@ -93,8 +93,8 @@ Auth token は `ENVIRONMENT_API_TOKEN` または `HOME_CONTROL_API_TOKEN` を使
 - feedback は `schema_version`、`workflow_version`、`received_at`、`received_snapshot_id`、`idempotency_key`、`status`、`warnings` を保持します。古い pending は `accepted_with_warning` として保存します。
 - `/feedback/state-query/summary` は `label_counts`、`status_counts`、`reason_counts`、`source_context_counts`、`action_counts`、`expected_state_counts`、`learning` を返します。`status_counts` は `accepted`、`accepted_with_warning`、`duplicate`、`rejected` の固定キーです。`duplicate` と `rejected` は実行中プロセスの診断カウントです。
 - `learning.level` は `none`、`collecting`、`seeded`、`usable`、`reinforced` の5段階です。`learning.problems[]` には `code`、`severity`、`message` が入り、feedbackが少ない、on/offの片側がない、操作後確認がない、rejectがある、といった「学習できていない理由」を機械判定できます。
-- `/environment/relations` は関連メタデータであり、Dify ID や Home Assistant ID の authority ではありません。
-- display 用 endpoint は Dify relation、raw Home Assistant event history、raw entity ID を省きます。
+- `/environment/relations` は関連メタデータであり、Home Assistant ID や snapshot ID の authority ではありません。
+- display 用 endpoint は relation metadata、raw Home Assistant event history、raw entity ID を省きます。
 
 ## Security
 

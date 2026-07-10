@@ -394,7 +394,6 @@ class EnvironmentHttpServerTest(unittest.TestCase):
             url = f"http://127.0.0.1:{server.server_port}/environment/relations"
             payload = json.dumps(
                 {
-                    "dify_issue_id": "HCA-42",
                     "ha_request_id": "ha-42",
                     "ha_execution_id": "exec-42",
                     "snapshot_id": "env_20260507_000000_000042",
@@ -415,7 +414,11 @@ class EnvironmentHttpServerTest(unittest.TestCase):
 
             self.assertEqual(response.status, 200)
             self.assertTrue(body["ok"])
-            self.assertEqual(body["relations"]["dify_issue_id"], "HCA-42")
+            self.assertEqual(
+                set(body["relations"]),
+                {"ha_request_id", "ha_execution_id", "snapshot_id", "updated_at"},
+            )
+            self.assertEqual(body["relations"]["ha_request_id"], "ha-42")
             self.assertEqual(body["relations"]["ha_execution_id"], "exec-42")
             self.assertNotIn("ignored", body["relations"])
         finally:

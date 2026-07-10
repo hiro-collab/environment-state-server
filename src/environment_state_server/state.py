@@ -81,7 +81,6 @@ class EnvironmentStateStore:
         self._source_errors: dict[str, str | None] = {}
         self._snapshot_sequence = 0
         self._relations: dict[str, object] = {
-            "dify_issue_id": None,
             "ha_request_id": None,
             "ha_execution_id": None,
             "snapshot_id": None,
@@ -179,7 +178,7 @@ class EnvironmentStateStore:
             self._vision[key] = value
 
     def update_relations(self, relations: dict[str, Any]) -> dict[str, object]:
-        allowed = {"dify_issue_id", "ha_request_id", "ha_execution_id", "snapshot_id"}
+        allowed = {"ha_request_id", "ha_execution_id", "snapshot_id"}
         with self._lock:
             for key in allowed:
                 if key in relations:
