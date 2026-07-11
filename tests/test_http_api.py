@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
+import os
 import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from environment_state_server.feedback import StateQueryFeedbackStore
 from environment_state_server.http_api import EnvironmentHttpServer
@@ -19,6 +24,181 @@ ROOM_LIGHT_DOES_NOT_PROVE = [
     "physical_room_light_state",
     "home_assistant_light_state",
 ]
+
+SHARED_VECTOR_ENV = "SWORD_T1_ROOM_LIGHT_SHARED_VECTOR_PATH"
+SHARED_VECTOR_PATH = os.environ.get(SHARED_VECTOR_ENV)
+SHARED_VECTOR_MAX_BYTES = 256 * 1024
+SHARED_VECTOR_SHA256 = "e1f43a6dd5047ea48818079b0510b9f487c93b0f493c77bba57fc6abc89e41bd"
+ROOM_LIGHT_FIXTURE_UNAVAILABLE = "room_light_fixture_unavailable"
+ROOM_LIGHT_FIXTURE_INVALID = "room_light_fixture_invalid"
+SHARED_VECTOR_CASE_IDS = [
+    "canonical_camera_hub", "canonical_vision_snapshot_processor", "malformed_nested_sequence",
+    "wrong_numeric_type", "nonfinite_numeric", "out_of_range_numeric", "wrong_case",
+    "stale_freshness", "reversed_ordered_nonclaims", "non_room_light",
+    "unknown_field_non_echo", "wrong_proof_ceiling",
+    "responsiveness_same_identity_material_movement",
+    "responsiveness_changed_identity_no_material_movement",
+    "responsiveness_changed_identity_material_movement",
+]
+SHARED_VECTOR_PAYLOAD_KEYS = {
+    "type", "schema_version", "observation_bucket", "confidence", "daylight_ambiguity",
+    "cue_likelihoods", "source", "source_class", "observed_at", "observation_id",
+    "source_snapshot_id", "sequence", "model", "freshness", "proof_ceiling",
+    "does_not_prove",
+}
+
+
+def _http_expected_classes(case_id: str) -> tuple[str, str, str, str]:
+    invalid = {
+        "malformed_nested_sequence", "wrong_numeric_type", "nonfinite_numeric",
+        "out_of_range_numeric", "wrong_case", "reversed_ordered_nonclaims",
+        "non_room_light", "wrong_proof_ceiling",
+    }
+    if case_id in invalid:
+        return "invalid", "unavailable", "fail", "noncanonical_camera_environment_estimate"
+    if case_id == "stale_freshness":
+        return "valid", "unavailable", "partial", "material_camera_environment_estimate_change_with_new_observation"
+    if case_id == "responsiveness_same_identity_material_movement":
+        return "valid", "camera-environment-estimate-high-confidence", "fail", "material_camera_environment_estimate_change_without_new_observation"
+    if case_id == "responsiveness_changed_identity_no_material_movement":
+        return "valid", "camera-environment-estimate-high-confidence", "fail", "new_observation_without_material_camera_environment_estimate_change"
+    return "valid", "camera-environment-estimate-high-confidence", "pass", "material_camera_environment_estimate_change_with_new_observation"
+
+
+def _require_room_light_fixture(condition: bool) -> None:
+    if not condition:
+        raise AssertionError(ROOM_LIGHT_FIXTURE_INVALID) from None
+
+
+def _assert_safe_http_shared_value(value: object) -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            _require_room_light_fixture(isinstance(key, str) and key.isprintable() and len(key) <= 80)
+            _assert_safe_http_shared_value(nested)
+    elif isinstance(value, list):
+        _require_room_light_fixture(len(value) <= 20)
+        for nested in value:
+            _assert_safe_http_shared_value(nested)
+    elif isinstance(value, str):
+        _require_room_light_fixture(value.isprintable() and len(value) <= 200 and "\\" not in value and "://" not in value)
+    else:
+        _require_room_light_fixture(value is None or isinstance(value, (bool, int, float)))
+        if isinstance(value, float):
+            _require_room_light_fixture(math.isfinite(value))
+
+
+def _validate_http_shared_fixture(data: object) -> dict[str, object]:
+    try:
+        _require_room_light_fixture(isinstance(data, dict))
+        _require_room_light_fixture(set(data) == {"fixture_version", "fixture_kind", "unknown_field_sentinel", "cases"})
+        _require_room_light_fixture(data["fixture_version"] == "room-light-shared-vectors.v1")
+        _require_room_light_fixture(data["fixture_kind"] == "non_schema_test_vectors")
+        _require_room_light_fixture(data["unknown_field_sentinel"] == "fixed-unknown-room-light-sentinel-7e57")
+        cases = data["cases"]
+        _require_room_light_fixture(isinstance(cases, list) and len(cases) == 15)
+        _require_room_light_fixture([row.get("case_id") for row in cases if isinstance(row, dict)] == SHARED_VECTOR_CASE_IDS)
+        for row in cases:
+            _require_room_light_fixture(isinstance(row, dict))
+            case_id = row["case_id"]
+            row_keys = {"case_id", "baseline", "followup", "expected"}
+            if case_id == "nonfinite_numeric":
+                row_keys.add("synthetic_numeric_class")
+                _require_room_light_fixture(row["synthetic_numeric_class"] == "followup_confidence_nan")
+            _require_room_light_fixture(set(row) == row_keys)
+            expected = row["expected"]
+            _require_room_light_fixture(isinstance(expected, dict))
+            _require_room_light_fixture(set(expected) == {"validation_class", "claim_class", "responsiveness_class", "delta_class", "unknown_echo_class"})
+            _require_room_light_fixture(tuple(expected[key] for key in ("validation_class", "claim_class", "responsiveness_class", "delta_class")) == _http_expected_classes(case_id))
+            _require_room_light_fixture(expected["unknown_echo_class"] == "not_echoed")
+            for phase in ("baseline", "followup"):
+                payload = row[phase]
+                _require_room_light_fixture(isinstance(payload, dict))
+                keys = set(SHARED_VECTOR_PAYLOAD_KEYS)
+                if phase == "followup" and case_id == "unknown_field_non_echo":
+                    keys.add("unknown_test_field")
+                    _require_room_light_fixture(payload["unknown_test_field"] == data["unknown_field_sentinel"])
+                _require_room_light_fixture(set(payload) == keys)
+                _require_room_light_fixture(set(payload["cue_likelihoods"]) == {"warm_light", "daylight", "darkness"})
+                _require_room_light_fixture(set(payload["sequence"]) == {"first_frame_id", "last_frame_id", "frame_count", "temporal_window_ms"})
+                _require_room_light_fixture(set(payload["model"]) == {"name", "kind"})
+                _require_room_light_fixture(set(payload["freshness"]) == {"level"})
+                _require_room_light_fixture(payload["source"] in {"camera_hub", "vision_snapshot_processor"})
+                expected_nonclaims = list(ROOM_LIGHT_DOES_NOT_PROVE)
+                if case_id == "reversed_ordered_nonclaims" and phase == "followup":
+                    expected_nonclaims.reverse()
+                _require_room_light_fixture(payload["does_not_prove"] == expected_nonclaims)
+                _require_room_light_fixture(str(payload["observation_id"]).startswith("synthetic-"))
+                _require_room_light_fixture("observation-" in str(payload["observation_id"]))
+                _require_room_light_fixture(str(payload["source_snapshot_id"]).startswith("synthetic-"))
+                _require_room_light_fixture("snapshot-" in str(payload["source_snapshot_id"]))
+        _require_room_light_fixture(sum(row["expected"]["validation_class"] == "valid" for row in cases) == 7)
+        _require_room_light_fixture(sum(row["expected"]["claim_class"] == "camera-environment-estimate-high-confidence" for row in cases) == 6)
+        _assert_safe_http_shared_value(data)
+        return data
+    except AssertionError:
+        raise
+    except (AttributeError, KeyError, OverflowError, RecursionError, TypeError, ValueError):
+        raise AssertionError(ROOM_LIGHT_FIXTURE_INVALID) from None
+
+
+def _load_http_shared_fixture() -> dict[str, object]:
+    if not SHARED_VECTOR_PATH:
+        raise AssertionError(ROOM_LIGHT_FIXTURE_UNAVAILABLE) from None
+    try:
+        path = Path(SHARED_VECTOR_PATH).expanduser()
+        _require_room_light_fixture(len(str(path)) <= 4096)
+    except AssertionError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise AssertionError(ROOM_LIGHT_FIXTURE_INVALID) from None
+    try:
+        if not path.is_file():
+            raise AssertionError(ROOM_LIGHT_FIXTURE_UNAVAILABLE) from None
+        size = path.stat().st_size
+        _require_room_light_fixture(0 < size <= SHARED_VECTOR_MAX_BYTES)
+        raw = path.read_bytes()
+    except AssertionError:
+        raise
+    except OSError:
+        raise AssertionError(ROOM_LIGHT_FIXTURE_UNAVAILABLE) from None
+    _require_room_light_fixture(len(raw) == size)
+    _require_room_light_fixture(hashlib.sha256(raw).hexdigest() == SHARED_VECTOR_SHA256)
+    try:
+        data = json.loads(raw.decode("utf-8"), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise AssertionError(ROOM_LIGHT_FIXTURE_INVALID) from None
+    return _validate_http_shared_fixture(data)
+
+
+def _http_shared_envelope(vector: dict[str, object]) -> tuple[dict[str, object], str]:
+    payload = deepcopy(vector)
+    source = str(payload.pop("source"))
+    payload.pop("freshness")
+    payload.pop("source_snapshot_id")
+    payload["source"] = "vision_snapshot_processor"
+    observed = datetime.fromisoformat(str(payload["observed_at"]).replace("Z", "+00:00"))
+    sequence = payload["sequence"]
+    _require_room_light_fixture(isinstance(sequence, dict))
+    seq = sequence.get("last_frame_id")
+    return {
+        "schema_version": 1,
+        "topic": "/vision/room_light/observation",
+        "msg_type": "vision_snapshot_processor/RoomLightObservation",
+        "header": {"seq": seq if type(seq) is int else 0, "stamp": observed.timestamp(), "frame_id": "synthetic-camera"},
+        "payload": payload,
+    }, source
+
+
+def _ingest_http_shared_vector(store: EnvironmentStateStore, vector: dict[str, object], *, nonfinite: bool = False) -> None:
+    envelope, source = _http_shared_envelope(vector)
+    payload = envelope["payload"]
+    _require_room_light_fixture(isinstance(payload, dict))
+    if nonfinite:
+        payload["confidence"] = float("nan")
+    if source == "camera_hub":
+        store.ingest_camera_hub_envelope(envelope)
+    else:
+        store.ingest_vision_envelope(envelope, source=source)
 
 
 def _room_light_envelope(
@@ -159,6 +339,146 @@ class EnvironmentHttpServerTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
+
+    @unittest.skipUnless(SHARED_VECTOR_PATH, f"set {SHARED_VECTOR_ENV} to run Parent shared-vector HTTP sensitivity")
+    def test_shared_room_light_http_fixture_shape_sensitivity(self) -> None:
+        fixture = _load_http_shared_fixture()
+        mutations = []
+
+        reordered = deepcopy(fixture)
+        reordered["cases"][0], reordered["cases"][1] = reordered["cases"][1], reordered["cases"][0]
+        mutations.append(("reordered", reordered))
+        removed = deepcopy(fixture)
+        removed["cases"].pop()
+        mutations.append(("removed", removed))
+        extra = deepcopy(fixture)
+        extra["unexpected"] = True
+        mutations.append(("extra", extra))
+        malformed = deepcopy(fixture)
+        malformed["cases"][0]["followup"]["sequence"]["unexpected"] = 1
+        mutations.append(("malformed_nested_field", malformed))
+
+        for name, candidate in mutations:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(AssertionError, f"^{ROOM_LIGHT_FIXTURE_INVALID}$"):
+                    _validate_http_shared_fixture(candidate)
+
+    def test_shared_room_light_http_loader_failures_are_fixed_and_non_echoing(self) -> None:
+        global SHARED_VECTOR_PATH
+
+        original_path = SHARED_VECTOR_PATH
+        env_was_present = SHARED_VECTOR_ENV in os.environ
+        original_env = os.environ.get(SHARED_VECTOR_ENV)
+        injected_case = "injected-case-loader-secret"
+        injected_value = "injected-value-loader-secret"
+        injected_sentinel = "injected-sentinel-loader-secret"
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                missing = root / "missing-loader-secret.json"
+                malformed = root / "malformed-loader-secret.json"
+                malformed.write_text(
+                    f'{{"case_id":"{injected_case}","value":"{injected_value}","sentinel":"{injected_sentinel}"',
+                    encoding="utf-8",
+                )
+                oversized = root / "oversized-loader-secret.json"
+                oversized.write_bytes(b"x" * (SHARED_VECTOR_MAX_BYTES + 1))
+                unsafe = root / ("unsafe-loader-secret-" + "x" * 4096)
+                cases = (
+                    ("missing", str(missing), ROOM_LIGHT_FIXTURE_UNAVAILABLE),
+                    ("malformed", str(malformed), ROOM_LIGHT_FIXTURE_INVALID),
+                    ("size_violation", str(oversized), ROOM_LIGHT_FIXTURE_INVALID),
+                    ("unsafe_path", str(unsafe), ROOM_LIGHT_FIXTURE_INVALID),
+                )
+                for name, configured, expected in cases:
+                    with self.subTest(name=name):
+                        os.environ[SHARED_VECTOR_ENV] = configured
+                        SHARED_VECTOR_PATH = configured
+                        with self.assertRaises(AssertionError) as raised:
+                            _load_http_shared_fixture()
+                        message = str(raised.exception)
+                        self.assertEqual(message, expected)
+                        self.assertIsNone(raised.exception.__cause__)
+                        for forbidden in (
+                            configured,
+                            Path(configured).name,
+                            str(SHARED_VECTOR_MAX_BYTES + 1),
+                            injected_case,
+                            injected_value,
+                            injected_sentinel,
+                            "No such file",
+                            "The system cannot find",
+                            "[Errno",
+                        ):
+                            self.assertNotIn(forbidden, message)
+        finally:
+            SHARED_VECTOR_PATH = original_path
+            if env_was_present:
+                assert original_env is not None
+                os.environ[SHARED_VECTOR_ENV] = original_env
+            else:
+                os.environ.pop(SHARED_VECTOR_ENV, None)
+
+    @unittest.skipUnless(SHARED_VECTOR_PATH, f"set {SHARED_VECTOR_ENV} to run Parent shared-vector HTTP consumer")
+    def test_shared_room_light_vectors_use_http_safe_projection(self) -> None:
+        fixture = _load_http_shared_fixture()
+        cases = fixture["cases"]
+        _require_room_light_fixture(isinstance(cases, list))
+        sentinel = str(fixture["unknown_field_sentinel"])
+        server = EnvironmentHttpServer(("127.0.0.1", 0), store=EnvironmentStateStore(), api_token="secret")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        actual_counts = {"valid": 0, "invalid": 0, "available": 0, "unavailable": 0}
+        try:
+            for row in cases:
+                _require_room_light_fixture(isinstance(row, dict))
+                case_id = str(row["case_id"])
+                baseline = row["baseline"]
+                followup = row["followup"]
+                expected = row["expected"]
+                _require_room_light_fixture(isinstance(baseline, dict) and isinstance(followup, dict) and isinstance(expected, dict))
+                with self.subTest(case_id=case_id):
+                    store = EnvironmentStateStore(ttl_ms=5000)
+                    server.store = store
+                    _ingest_http_shared_vector(store, baseline)
+                    _ingest_http_shared_vector(store, followup, nonfinite=case_id == "nonfinite_numeric")
+                    followup_time = datetime.fromisoformat(str(followup["observed_at"]).replace("Z", "+00:00"))
+                    now = followup_time + timedelta(seconds=6 if case_id == "stale_freshness" else 1)
+                    url = f"http://127.0.0.1:{server.server_port}/environment/current"
+                    request = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
+                    with patch("environment_state_server.state.utc_now", return_value=now):
+                        with urllib.request.urlopen(request, timeout=2) as response:
+                            body = json.loads(response.read().decode("utf-8"))
+
+                    self.assertEqual(response.status, 200)
+                    room_light = body["vision"]["room_light"]
+                    accepted = room_light["observed_at"] == followup_time.isoformat()
+                    actual_validation = "valid" if accepted else "invalid"
+                    actual_claim = (
+                        "camera-environment-estimate-high-confidence"
+                        if accepted and not room_light["stale"] and room_light["confidence"] >= 0.9
+                        else "unavailable"
+                    )
+                    actual_counts[actual_validation] += 1
+                    actual_counts["available" if actual_claim != "unavailable" else "unavailable"] += 1
+
+                    self.assertEqual(actual_validation, expected["validation_class"])
+                    self.assertEqual(actual_claim, expected["claim_class"])
+                    self.assertEqual(room_light["stale"], case_id == "stale_freshness")
+                    self.assertEqual(room_light["does_not_prove"], ROOM_LIGHT_DOES_NOT_PROVE)
+                    self.assertEqual(room_light["proof_ceiling"], "camera_environment_estimate_only")
+                    self.assertNotIn("room_light", body["state_queries"])
+                    self.assertNotIn("feedback", body)
+                    serialized = json.dumps(body, allow_nan=False)
+                    self.assertNotIn(sentinel, serialized)
+                    self.assertNotIn(str(baseline["source_snapshot_id"]), serialized)
+                    self.assertNotIn(str(followup["source_snapshot_id"]), serialized)
+            self.assertEqual(actual_counts, {"valid": 7, "invalid": 8, "available": 6, "unavailable": 9})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_indicators_current_is_public_and_sanitized(self) -> None:
         store = EnvironmentStateStore()
         server = EnvironmentHttpServer(("127.0.0.1", 0), store=store, api_token="secret")
